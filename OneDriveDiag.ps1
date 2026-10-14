@@ -212,6 +212,8 @@ $script:OdlFilesRead = @()
 $script:OdlFilesToCopy = @()
 $script:BoundParams = @{}
 $script:PendingLog = New-Object System.Collections.ArrayList   # log lines held until the run log exists
+$script:OneDriveExe = $null       # path of the running (or installed) OneDrive.exe, used in fix instructions
+$script:CloudProtection = $null   # Defender cloud-delivered protection (MAPSReporting): 0 off, 1 basic, 2 advanced
 $script:CountFail = 0
 $script:CountWarn = 0
 $script:OutputParent = $null
@@ -704,6 +706,11 @@ function Step-Environment {
     try {
         $mp = Get-MpPreference -ErrorAction Stop
         if ($null -ne $mp.EnableControlledFolderAccess) { $cfa = [int]$mp.EnableControlledFolderAccess; $cfaSource = 'Get-MpPreference' }
+        # Defender recognises trusted apps (such as Microsoft-signed OneDrive.exe) through cloud-delivered protection.
+        if ($null -ne $mp.MAPSReporting) {
+            $script:CloudProtection = [int]$mp.MAPSReporting
+            [void]$o.Add(('Cloud protection     : MAPSReporting {0} ({1})' -f $script:CloudProtection, @('Off', 'Basic', 'Advanced')[[Math]::Min(2, $script:CloudProtection)]))
+        }
         if ($mp.ControlledFolderAccessAllowedApplications) { [void]$o.Add('Allowed apps         : ' + ($mp.ControlledFolderAccessAllowedApplications -join '; ')) }
     }
     catch { }
@@ -744,7 +751,15 @@ function Step-Environment {
         $detail = ('{0} Controlled Folder Access block event(s) mention OneDrive. Latest {1}.' -f $blocks.Count, $blocks[0].TimeCreated) + $appText
         if ($apps -contains 'OneDrive.exe') {
             # OneDrive itself is blocked from writing into its own folders (usually Documents or Desktop after Known Folder Move).
-            Add-Finding 'Environment' 'Controlled Folder Access blocks OneDrive' 'FAIL' $detail 'Defender is stopping OneDrive.exe from writing into protected folders, so downloads and changes into those folders fail. Ask security to add OneDrive.exe to the Controlled Folder Access allowed apps (Intune or Defender policy). Blocked paths are in 01_Environment.txt.'
+            # Only an ongoing problem is a FAIL: 3 or more blocks of OneDrive.exe in the window, or one in the last 24 hours.
+            # A single older block is usually a one-off (for example straight after a OneDrive update) and is a WARN.
+            $odBlocks = @($blocks | Where-Object { $_.Message -match '(?i)OneDrive\.exe' })
+            $recent = @($odBlocks | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-24) })
+            if ($script:CloudProtection -eq 0) { $detail += ' Cloud-delivered protection is OFF, which stops Defender recognising trusted apps such as OneDrive.exe.' }
+            $sev = 'WARN'
+            if ($odBlocks.Count -ge 3 -or $recent.Count -gt 0) { $sev = 'FAIL' }
+            else { $detail += ' Isolated block with none in the last 24 hours: probably not the cause of an ongoing fault.' }
+            Add-Finding 'Environment' 'Controlled Folder Access blocks OneDrive' $sev $detail 'Defender is stopping OneDrive.exe from writing into protected folders, so downloads and changes into those folders fail. Ask security to add OneDrive.exe to the Controlled Folder Access allowed apps (Intune or Defender policy). Blocked paths are in 01_Environment.txt.'
         }
         else {
             Add-Finding 'Environment' 'Controlled Folder Access blocks' 'WARN' $detail 'Defender is blocking writes to protected folders. Ask security to allow the blocked app, or review the blocked paths in 01_Environment.txt.'
@@ -812,6 +827,7 @@ function Step-Client {
     }
     else {
         $script:Facts['OneDrive version'] = $found[0].Version + ' (' + $found[0].Type + ')'
+        if (-not $script:OneDriveExe) { $script:OneDriveExe = $found[0].Path }   # replaced by the running copy below when found
         if ($found.Count -gt 1) {
             Add-Finding 'Client' 'Multiple installs' 'INFO' ('{0} copies of OneDrive.exe found (per-user and per-machine).' -f $found.Count) 'Normal during a move from per-user to per-machine. Confirm which copy is running.'
         }
@@ -834,6 +850,7 @@ function Step-Client {
             [void]$o.Add('Path: ' + $path)
         }
         $script:Facts['OneDrive running'] = 'Yes (started ' + $procs[0].StartTime + ')'
+        try { if ($procs[0].Path) { $script:OneDriveExe = $procs[0].Path } } catch { }
         Add-Finding 'Client' 'OneDrive process' 'PASS' ('Running, started {0}.' -f $procs[0].StartTime)
         if ($procs[0].WorkingSet64 -gt 2GB) {
             Add-Finding 'Client' 'OneDrive memory' 'WARN' ('OneDrive is using {0} of memory.' -f (Format-Bytes $procs[0].WorkingSet64)) 'Very high memory use is common on libraries with many files. Note it for the escalation.'
@@ -2227,7 +2244,9 @@ function Step-OdlSignatures {
                 $snippet = ($leftRx.Match($left).Value + $rm.Value).Trim()
                 $lastEnd = $m.Index + $rm.Length
                 $snippet = [regex]::Replace($snippet, '[0-9a-fA-F]{32}(\+\d+)?', '<id>')
-                $snippet = [regex]::Replace($snippet, '[A-Za-z0-9_\-]{36,}', '<token>')
+                # Long tokens are only replaced when they contain a digit (ids, hashes, base64). Long digit-free
+                # names such as FileSyncError::ErrorCode::<LongErrorName> are the most useful part and are kept.
+                $snippet = [regex]::Replace($snippet, '(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{36,}', '<token>')
                 if ($sigCounts.ContainsKey($snippet)) { $sigCounts[$snippet] = 1 + [long]$sigCounts[$snippet] }
                 elseif ($sigCounts.Count -lt 4000) { $sigCounts[$snippet] = 1; $sigFile[$snippet] = $f.Name }
                 else { $overflow++ }
@@ -2318,6 +2337,38 @@ function Step-RawLogs {
 # SECTION 7. REPORT, MANIFEST AND ZIP
 # ----------------------------------------------------------------------------------------------
 
+function Get-FixSteps {
+    # Step-by-step fix instructions for findings that need more than one line of advice.
+    # Shown on screen at the end of the run and written to 00_Summary.txt. Returns no lines for other checks.
+    param([string]$Check)
+    $exe = $script:OneDriveExe
+    if (-not $exe) { $exe = 'C:\Program Files\Microsoft OneDrive\OneDrive.exe' }
+    switch ($Check) {
+        'Controlled Folder Access blocks OneDrive' {
+            return @(
+                'HOW TO FIX: Controlled Folder Access is blocking OneDrive.exe',
+                '  Defender ransomware protection did not recognise OneDrive.exe as trusted, so it blocks OneDrive',
+                '  writing into protected folders (Documents, Desktop, Pictures). Add OneDrive.exe as an allowed app.',
+                ('  Path to allow on this PC: ' + $exe),
+                '  Pick the option that matches how this PC is managed (ask security or the Intune admin):',
+                '  A. Intune: Endpoint security > Attack surface reduction > Create policy > Windows >',
+                '     Attack Surface Reduction Rules > Controlled Folder Access Allowed Applications > add the path.',
+                '     Assign to the device group, then sync the device (Settings > Accounts > Access work or school > Info > Sync).',
+                '  B. Group Policy: Computer Configuration > Administrative Templates > Windows Components >',
+                '     Microsoft Defender Antivirus > Microsoft Defender Exploit Guard > Controlled Folder Access >',
+                '     Configure allowed applications > Enabled > Show > Value name = the path, Value = 0. Then gpupdate /force.',
+                '  C. Unmanaged PC only, in an elevated PowerShell on the PC:',
+                ('     Add-MpPreference -ControlledFolderAccessAllowedApplications ''' + $exe + ''''),
+                '     (Or Windows Security > Virus and threat protection > Ransomware protection > Allow an app through',
+                '     Controlled folder access > Add an allowed app > Recently blocked apps.) A policy can override local changes.',
+                '  Also check Defender cloud-delivered protection is On. Defender uses it to trust Microsoft-signed apps.',
+                '  Then restart OneDrive, re-run this tool, and confirm no new block events (see the guide, Troubleshooting).'
+            )
+        }
+    }
+    return @()
+}
+
 function Step-Report {
     # STEP: Write the plain-language summary, the findings CSV and the manifest.
     $finish = Get-Date
@@ -2383,6 +2434,12 @@ function Step-Report {
             [void]$s.Add(('  {0}: {1:N0} items, mode {2}{3}. Details: 11_FileSystem_{4}_Summary.txt' -f $r.Title, $r.Items, $r.Mode, $partial, $r.Label))
         }
         [void]$s.Add('')
+    }
+
+    # Detailed fix steps for findings that have them.
+    foreach ($f in @($sorted | Where-Object { $_.Status -eq 'FAIL' -or $_.Status -eq 'WARN' })) {
+        $steps = @(Get-FixSteps -Check $f.Check)
+        if ($steps.Count -gt 0) { foreach ($line in $steps) { [void]$s.Add($line) }; [void]$s.Add('') }
     }
 
     [void]$s.Add('WHAT TO DO NEXT')
@@ -2581,6 +2638,16 @@ $shown = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -or $_.Status 
 foreach ($f in $shown) { Write-Host ('    [{0}] {1}: {2}' -f $f.Status, $f.Check, $f.Detail) -ForegroundColor $(if ($f.Status -eq 'FAIL') { 'Red' } else { 'Yellow' }) }
 if ($script:ZipKeepFolder -or -not $script:DoZip) { Write-Host ('  Folder : {0}' -f $script:OutDir) }
 if ($script:ZipPath) { Write-Host ('  Zip    : {0}' -f $script:ZipPath) }
+# Fix steps for findings that need more than one line, so the helpdesk sees them without opening the summary.
+foreach ($f in $shown) {
+    $steps = @(Get-FixSteps -Check $f.Check)
+    if ($steps.Count -gt 0) {
+        Write-Host ''
+        Write-Host $steps[0] -ForegroundColor Yellow
+        foreach ($line in ($steps | Select-Object -Skip 1)) { Write-Host $line }
+    }
+}
+if ($shown.Count -gt 0) { Write-Host '' }
 Write-Host '  Next   : open 00_Summary.txt first. Attach the zip (or folder) to the ticket.'
 Write-Host '  Note   : the package contains file and folder names. Handle it as confidential.' -ForegroundColor DarkGray
 if ($OpenOutput.IsPresent) {
