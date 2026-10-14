@@ -518,12 +518,41 @@ function Test-RunContext {
     if ($script:ExplorerOwners.Count -gt 0 -and ($script:ExplorerOwners -notcontains $id.Name)) {
         $script:UserMismatch = $true
     }
+    Resolve-UserPaths -Identity $id
+}
+
+function Resolve-UserPaths {
+    # Works out the profile and AppData\Local folders of the account this script runs as.
+    # RMM shells (for example "run as logged-on user") often keep the environment variables of the SYSTEM
+    # agent, so %USERPROFILE%, %LOCALAPPDATA% and %OneDrive% can point at C:\Windows\system32\config\systemprofile.
+    # The registry entries below belong to the running account itself, so they are trusted first.
+    param([Security.Principal.WindowsIdentity]$Identity)
+    $script:UserName = ($Identity.Name -split '\\')[-1]
+
+    # 1. Profile folder from ProfileList, keyed by the account SID.
+    $prof = $null
+    try {
+        $prof = (Get-ItemProperty -LiteralPath ('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $Identity.User.Value) -ErrorAction Stop).ProfileImagePath
+        if ($prof) { $prof = [Environment]::ExpandEnvironmentVariables($prof) }
+    }
+    catch { }
+    if (-not $prof) { $prof = $env:USERPROFILE }
+    $script:UserProfile = ([string]$prof).TrimEnd('\')
+
+    # 2. AppData\Local from the user's own Shell Folders key (already expanded), else <profile>\AppData\Local.
+    $lad = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -ErrorAction SilentlyContinue).'Local AppData'
+    if (-not $lad -or -not (Test-Path -LiteralPath $lad)) { $lad = Join-Path $script:UserProfile 'AppData\Local' }
+    if (-not (Test-Path -LiteralPath $lad)) { $lad = $env:LOCALAPPDATA }
+    $script:LocalAppData = ([string]$lad).TrimEnd('\')
+
+    # 3. Note when the shell environment belongs to another profile, so the reviewer knows why.
+    $script:EnvMismatch = ($env:USERPROFILE -and ($env:USERPROFILE.TrimEnd('\') -ine $script:UserProfile))
 }
 
 function New-OutputFolder {
     # Creates c:\temp\onedrivediag_<hostname>_<username>_<DATETIME>\ and the run log.
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $name = 'onedrivediag_{0}_{1}_{2}' -f $env:COMPUTERNAME, $env:USERNAME, $stamp
+    $name = 'onedrivediag_{0}_{1}_{2}' -f $env:COMPUTERNAME, (Get-SafeName $script:UserName), $stamp
     $root = $OutputRoot
     try {
         if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null }
@@ -532,7 +561,7 @@ function New-OutputFolder {
     }
     catch {
         # The chosen location is not writable. Use the user temp folder instead.
-        $root = $env:TEMP
+        $root = Join-Path $script:LocalAppData 'Temp'
         $script:OutDir = Join-Path $root $name
         New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null
         Write-Host ('  Could not write to {0}. Using {1} instead.' -f $OutputRoot, $root) -ForegroundColor Yellow
@@ -703,7 +732,23 @@ function Step-Environment {
     }
     $blocks = @($cfaEvents | Where-Object { $_.Id -eq 1123 })
     if ($blocks.Count -gt 0) {
-        Add-Finding 'Environment' 'Controlled Folder Access blocks' 'WARN' ('{0} Controlled Folder Access block event(s) mention OneDrive. Latest {1}.' -f $blocks.Count, $blocks[0].TimeCreated) 'Defender is blocking writes to protected folders. Ask security to allow the blocked app, or review the blocked paths in 01_Environment.txt.'
+        # Name the blocked programs (file name only), so the helpdesk knows what to ask security to allow.
+        # The message either starts "<app.exe> has been blocked from modifying ..." or carries a "Process Name:" line.
+        $apps = @($blocks | ForEach-Object {
+                $pm = [regex]::Match($_.Message, '^\s*(.+?\.exe)\s+(has been|would have been) blocked', 'IgnoreCase')
+                if (-not $pm.Success) { $pm = [regex]::Match($_.Message, '(?im)^\s*Process Name:\s*(.+?)\s*$') }
+                if ($pm.Success) { Split-Path -Leaf $pm.Groups[1].Value }
+            } | Where-Object { $_ } | Select-Object -Unique)
+        $appText = ''
+        if ($apps.Count -gt 0) { $appText = ' Blocked app(s): ' + ($apps -join ', ') + '.' }
+        $detail = ('{0} Controlled Folder Access block event(s) mention OneDrive. Latest {1}.' -f $blocks.Count, $blocks[0].TimeCreated) + $appText
+        if ($apps -contains 'OneDrive.exe') {
+            # OneDrive itself is blocked from writing into its own folders (usually Documents or Desktop after Known Folder Move).
+            Add-Finding 'Environment' 'Controlled Folder Access blocks OneDrive' 'FAIL' $detail 'Defender is stopping OneDrive.exe from writing into protected folders, so downloads and changes into those folders fail. Ask security to add OneDrive.exe to the Controlled Folder Access allowed apps (Intune or Defender policy). Blocked paths are in 01_Environment.txt.'
+        }
+        else {
+            Add-Finding 'Environment' 'Controlled Folder Access blocks' 'WARN' $detail 'Defender is blocking writes to protected folders. Ask security to allow the blocked app, or review the blocked paths in 01_Environment.txt.'
+        }
     }
     elseif ($cfa -eq 1 -or $cfa -eq 3) {
         Add-Finding 'Environment' 'Controlled Folder Access' 'INFO' ('Controlled Folder Access is {0}. No OneDrive blocks recorded.' -f $cfaNames[$cfa]) 'If files in Desktop or Documents will not save or sync, check Defender protection history.'
@@ -747,7 +792,7 @@ function Step-Client {
     $o = New-Object System.Collections.ArrayList
     $x86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
     $candidates = @(
-        @{ Path = (Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive\OneDrive.exe'); Type = 'Per-user install' },
+        @{ Path = (Join-Path $script:LocalAppData 'Microsoft\OneDrive\OneDrive.exe'); Type = 'Per-user install' },
         @{ Path = (Join-Path $env:ProgramFiles 'Microsoft OneDrive\OneDrive.exe'); Type = 'Per-machine install' }
     )
     if ($x86) { $candidates += @{ Path = (Join-Path $x86 'Microsoft OneDrive\OneDrive.exe'); Type = 'Per-machine install (32-bit)' } }
@@ -870,7 +915,7 @@ function Step-AccountsAndRoots {
     # STEP: Find every OneDrive account and every synced library. This gives the REAL local folders.
     # SharePoint libraries are frequently mounted outside the "OneDrive - <Company>" folder, so we cannot guess the path.
     $o = New-Object System.Collections.ArrayList
-    $odBase = Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive'
+    $odBase = Join-Path $script:LocalAppData 'Microsoft\OneDrive'
     $accounts = New-Object System.Collections.ArrayList
 
     [void]$o.Add('=== ONEDRIVE ACCOUNTS (HKCU:\Software\Microsoft\OneDrive\Accounts) ===')
@@ -955,8 +1000,18 @@ function Step-AccountsAndRoots {
     # Fall back to account user folders and OneDrive environment variables.
     $fallback = @()
     foreach ($a in $script:Accounts) { if ($a.UserFolder) { $fallback += $a.UserFolder } }
+    # OneDrive writes these variables to the user's own HKCU\Environment key, which is trusted.
+    # The shell's copy is only used when it points inside this user's profile, because RMM shells can carry
+    # the SYSTEM profile values (for example C:\Windows\system32\config\systemprofile\OneDrive).
+    $userEnv = Get-ItemProperty -LiteralPath 'HKCU:\Environment' -ErrorAction SilentlyContinue
     foreach ($ev in @('OneDriveCommercial', 'OneDrive', 'OneDriveConsumer')) {
-        $v = [Environment]::GetEnvironmentVariable($ev)
+        $v = $null
+        if ($userEnv -and $userEnv.$ev) { $v = [string]$userEnv.$ev }
+        else {
+            $pv = [Environment]::GetEnvironmentVariable($ev)
+            if ($pv -and $pv.StartsWith($script:UserProfile + '\', [StringComparison]::OrdinalIgnoreCase)) { $v = $pv }
+            elseif ($pv) { Write-Log ('Ignored shell variable {0}={1}: it is outside the user profile {2}.' -f $ev, $pv, $script:UserProfile) 'INFO' }
+        }
         if ($v) { $fallback += $v }
     }
     foreach ($f in $fallback) {
@@ -1549,7 +1604,7 @@ function Step-Network {
 
 function Step-Listings {
     # STEP: List (do not read) the OneDrive settings and log folders. File names, sizes and dates only.
-    $odBase = Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive'
+    $odBase = Join-Path $script:LocalAppData 'Microsoft\OneDrive'
     $settings = New-Object System.Collections.ArrayList
     $logs = New-Object System.Collections.ArrayList
     foreach ($a in $script:Accounts) {
@@ -2065,7 +2120,7 @@ function Get-OdlFileSet {
     #   .odl / .aodl : current binary logs
     #   .odlgz       : older logs, gzip compressed (decompressed in memory when scanned)
     #   .odlsent     : already uploaded to Microsoft and stripped; almost no readable text, so skipped
-    $logsBase = Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive\logs'
+    $logsBase = Join-Path $script:LocalAppData 'Microsoft\OneDrive\logs'
     if (-not (Test-Path -LiteralPath $logsBase)) { return @() }
     $folders = @(Get-Item -LiteralPath $logsBase) + @(Get-ChildItem -LiteralPath $logsBase -Directory -ErrorAction SilentlyContinue)
     $candidates = @()
@@ -2475,6 +2530,9 @@ if ($script:UserMismatch) {
         if (-not (Read-YesNo -Question 'Continue anyway?' -DefaultYes $false)) { Write-Host 'Cancelled.'; exit 1 }
     }
     Add-Finding 'Environment' 'User context mismatch' 'WARN' ('Running as {0}; desktop user is {1}.' -f $script:CurrentUser, ($script:ExplorerOwners -join ', ')) 'Run the tool again in the context of the desktop user.'
+}
+if ($script:EnvMismatch) {
+    Add-Finding 'Environment' 'Shell environment' 'INFO' ('The shell environment points at {0}, not this user profile ({1}). Typical of RMM shells.' -f $env:USERPROFILE, $script:UserProfile) 'No action needed. The tool reads the user profile from the registry instead of the environment.'
 }
 
 Get-RunSettings
