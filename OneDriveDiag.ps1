@@ -101,6 +101,12 @@
 .PARAMETER OpenOutput
     Open the output folder in File Explorer when finished.
 
+.PARAMETER SkipSyncState
+    Do not ask Windows whether each OneDrive item is marked "in sync". By default the file index checks every
+    placeholder with the Windows Cloud Files API and lists items that are NOT in sync, which are the items behind
+    red cross and sync-pending icons in File Explorer. The check needs PowerShell FullLanguage mode and is skipped
+    automatically when that is not available. Use this switch only if the check makes a very large scan too slow.
+
 .EXAMPLE
     .\OneDriveDiag.ps1
     Interactive run. You are guided through a list of choices.
@@ -177,7 +183,9 @@ param(
 
     [switch]$Unattended,
 
-    [switch]$OpenOutput
+    [switch]$OpenOutput,
+
+    [switch]$SkipSyncState
 )
 
 # ----------------------------------------------------------------------------------------------
@@ -214,6 +222,8 @@ $script:BoundParams = @{}
 $script:PendingLog = New-Object System.Collections.ArrayList   # log lines held until the run log exists
 $script:OneDriveExe = $null       # path of the running (or installed) OneDrive.exe, used in fix instructions
 $script:CloudProtection = $null   # Defender cloud-delivered protection (MAPSReporting): 0 off, 1 basic, 2 advanced
+$script:SyncStateReady = $null    # $true when the Cloud Files "in sync" check is available (see Initialize-SyncStateApi)
+$script:SyncStateNote = ''
 $script:CountFail = 0
 $script:CountWarn = 0
 $script:OutputParent = $null
@@ -1670,6 +1680,56 @@ function Test-ReparseTag {
     return $null
 }
 
+function Initialize-SyncStateApi {
+    # Loads a small C# helper that asks the Windows Cloud Files API (cldapi.dll, Windows 10 1709 and later) whether
+    # a placeholder is marked "in sync". File Explorer draws the green tick from this mark. Items that are NOT in
+    # sync show the sync-pending or red cross icon, and folders above them show the cross too.
+    # The item is opened for attribute reading only, as the reparse point itself, so nothing is downloaded.
+    # Returns $true when the helper is ready. Needs FullLanguage mode (Add-Type); returns $false otherwise.
+    if ($null -ne $script:SyncStateReady) { return $script:SyncStateReady }
+    $script:SyncStateReady = $false
+    if ($SkipSyncState.IsPresent) { $script:SyncStateNote = 'skipped (-SkipSyncState)'; return $false }
+    if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { $script:SyncStateNote = 'skipped (PowerShell is not in FullLanguage mode)'; return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\cldapi.dll'))) { $script:SyncStateNote = 'skipped (cldapi.dll not found)'; return $false }
+    $code = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace OneDriveDiag {
+    public static class SyncState {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("cldapi.dll")]
+        private static extern int CfGetPlaceholderInfo(SafeFileHandle handle, int infoClass, byte[] buffer, uint length, out uint returned);
+        // Returns 1 = in sync, 0 = NOT in sync, -1 = not a cloud placeholder, -2 = could not open the item.
+        public static int Get(string path) {
+            // 0x80 FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING,
+            // 0x02000000 FILE_FLAG_BACKUP_SEMANTICS (folders) + 0x00200000 FILE_FLAG_OPEN_REPARSE_POINT (no recall).
+            using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+                if (h.IsInvalid) { return -2; }
+                byte[] buffer = new byte[512];
+                uint returned;
+                int hr = CfGetPlaceholderInfo(h, 0, buffer, (uint)buffer.Length, out returned);
+                // 0x800700EA ERROR_MORE_DATA still fills the fixed part (PinState, InSyncState).
+                if (hr != 0 && hr != unchecked((int)0x800700EA)) { return -1; }
+                return BitConverter.ToInt32(buffer, 4);
+            }
+        }
+    }
+}
+'@
+    try {
+        if (-not ('OneDriveDiag.SyncState' -as [type])) { Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop }
+        $script:SyncStateReady = $true
+        $script:SyncStateNote = 'checked with the Cloud Files API'
+    }
+    catch {
+        $script:SyncStateNote = 'skipped (helper could not be loaded: ' + $_.Exception.Message + ')'
+        Write-Log ('Sync state check unavailable: ' + $_.Exception.Message) 'WARN'
+    }
+    return $script:SyncStateReady
+}
+
 function Invoke-FolderIndex {
     # Walks one folder tree once. Mode Full = whole tree. Mode TopLevel = first level only.
     param(
@@ -1735,6 +1795,9 @@ function Invoke-FolderIndex {
     $maxLocal = 0; $maxLocalPath = ''; $maxServer = 0; $maxServerPath = ''
     $reparseChecked = 0; $reparseCloud = 0; $reparseOther = 0; $reparseToolFailed = $false
     $tagCounts = @{}
+    # "In sync" state per placeholder (Cloud Files API). Items NOT in sync are the ones behind red cross icons.
+    $syncReady = Initialize-SyncStateApi
+    [long]$syncChecked = 0; [long]$syncIn = 0; [long]$syncNot = 0; [long]$syncOpenFail = 0
 
     function Add-ScanException {
         # Counts a problem item and writes a row until the per-category limit is reached.
@@ -1847,6 +1910,17 @@ function Invoke-FolderIndex {
                     }
 
                     # ---------- CHECKS THAT APPLY TO FILES AND FOLDERS ----------
+                    # In sync state, for cloud placeholders only (items with a reparse point).
+                    if ($syncReady -and (($attr -band 0x400) -ne 0)) {
+                        $ss = [OneDriveDiag.SyncState]::Get($full)
+                        if ($ss -eq 1) { $syncChecked++; $syncIn++ }
+                        elseif ($ss -eq 0) {
+                            $syncChecked++; $syncNot++
+                            $len0 = 0; if (-not $isDir) { $len0 = [long]$e.Length }
+                            Add-ScanException 'NotInSync' $full $attr $len0 $e.LastWriteTimeUtc $plen 0 $(if ($isDir) { 'Folder' } else { 'File' })
+                        }
+                        elseif ($ss -eq -2) { $syncOpenFail++ }
+                    }
                     if ($plen -gt $maxLocal) { $maxLocal = $plen; $maxLocalPath = $full.Substring($prefixLen) }
                     if ($plen -ge $PathWarnLength) { Add-ScanException 'LocalPathLength' $full $attr 0 $e.LastWriteTimeUtc $plen 0 }
                     if ($serverPrefix -ge 0) {
@@ -1913,6 +1987,13 @@ function Invoke-FolderIndex {
     [void]$s.Add(('  System or hidden files           : {0:N0}' -f $systemHidden))
     [void]$s.Add(('  Zero byte files                  : {0:N0}' -f $zeroByte))
     [void]$s.Add(('FOLDERS: pinned {0:N0}, unpinned {1:N0}' -f $foldersPinned, $foldersUnpinned))
+    [void]$s.Add('')
+    [void]$s.Add('IN SYNC STATE (what File Explorer uses for the green tick or the red cross): ' + $script:SyncStateNote)
+    if ($syncReady) {
+        [void]$s.Add(('  In sync          : {0:N0}' -f $syncIn))
+        [void]$s.Add(('  NOT in sync      : {0:N0}   (listed as NotInSync in the exceptions CSV)' -f $syncNot))
+        if ($syncOpenFail -gt 0) { [void]$s.Add(('  Could not open   : {0:N0}   (locked, removed during the scan, or access denied)' -f $syncOpenFail)) }
+    }
     [void]$s.Add(('Longest local path  : {0} characters  {1}' -f $maxLocal, $maxLocalPath))
     if ($serverPrefix -ge 0) { [void]$s.Add(('Longest server path : {0} characters (estimate)  {1}' -f $maxServer, $maxServerPath)) }
     [void]$s.Add('')
@@ -1953,6 +2034,7 @@ function Invoke-FolderIndex {
         Exceptions = $excCounts; LocalOnly = $localOnly; EnumErrors = $enumErrors; OnlineOnly = $onlineOnly
         LocallyAvailable = $locallyAvail; MaxLocalPath = $maxLocal; MaxServerPath = $maxServer
         ReparseOther = $reparseOther; ReparseChecked = $reparseChecked; ExceptionFile = $excPath; IndexFile = $idxPath
+        SyncChecked = $syncChecked; SyncNot = $syncNot; SyncOpenFail = $syncOpenFail; SyncReady = $syncReady
     }
 }
 
@@ -1981,12 +2063,20 @@ function Add-ScanFindings {
     $c = Get-Count 'ServerPathNearLimit'
     if ($c -gt 0) { Add-Finding 'File index' ('SharePoint path near limit: ' + $t) 'WARN' ('{0:N0} item(s) are within reach of the 400 character limit (from {1}).' -f $c, $ServerPathWarnLength) 'Long paths often fail when an extra sub folder or longer name is added.' }
     $c = Get-Count 'LocalPathLength'
-    if ($c -gt 0) { Add-Finding 'File index' ('Local path length: ' + $t) 'WARN' ('{0:N0} item(s) have a local path of {1} characters or more. Longest {2}.' -f $c, $PathWarnLength, $R.MaxLocalPath) 'File Explorer and many apps fail on long paths. A shorter sync folder location or shorter names helps.' }
+    if ($c -gt 0) { Add-Finding 'File index' ('Local path length: ' + $t) 'WARN' ('{0:N0} item(s) have a local path of {1} characters or more. Longest {2}.' -f $c, $PathWarnLength, $R.MaxLocalPath) 'OneDrive itself syncs these, but apps may not open or save them (desktop Excel fails above 218 characters in the full path). This is a usability risk, not usually a sync fault. Shorter folder names help.' }
     $c = Get-Count 'FileNotCloudManaged'
     if ($c -gt 25) { Add-Finding 'File index' ('Files not managed by OneDrive: ' + $t) 'WARN' ('{0:N0} file(s) are normal local files with no OneDrive placeholder state.' -f $c) 'These may be new files waiting to sync, or files OneDrive is not tracking. Check them in the exceptions CSV.' }
     elseif ($c -gt 0) { Add-Finding 'File index' ('Files not managed by OneDrive: ' + $t) 'INFO' ('{0:N0} file(s) are normal local files with no placeholder state.' -f $c) 'Often new or recently saved files that are about to sync.' }
     $c = Get-Count 'FolderNotCloudManaged'
     if ($c -gt 0) { Add-Finding 'File index' ('Folders not managed by OneDrive: ' + $t) 'INFO' ('{0:N0} folder(s) are normal local folders.' -f $c) 'New local folders appear here until OneDrive picks them up.' }
+    if ($R.SyncReady) {
+        if ($R.SyncNot -gt 0) {
+            Add-Finding 'File index' ('Items not in sync: ' + $t) 'WARN' ('{0:N0} of {1:N0} OneDrive item(s) are NOT marked in sync. These are the items behind red cross or sync-pending icons; their parent folders show the cross too.' -f $R.SyncNot, $R.SyncChecked) 'See the NotInSync rows in the exceptions CSV for the exact items. Ask the user to close the apps that use them (Office, Outlook, Explorer preview pane), then restart OneDrive and check again. If the same items stay not in sync, check them in SharePoint (permissions, checked out, retention or site lock).'
+        }
+        else {
+            Add-Finding 'File index' ('Items in sync: ' + $t) 'PASS' ('All {0:N0} OneDrive item(s) checked are marked in sync.' -f $R.SyncChecked)
+        }
+    }
     $c = Get-Count 'NonCloudReparseFolder'
     if ($c -gt 0) { Add-Finding 'File index' ('Junctions or links: ' + $t) 'WARN' ('{0:N0} sampled folder(s) are not cloud placeholders (junction or symbolic link).' -f $c) 'OneDrive does not follow links reliably. Review these in the exceptions CSV.' }
     foreach ($n in @('NameLeadingOrTrailingSpace', 'NameTrailingPeriod', 'WindowsReservedName', 'SharePointReservedName')) {
@@ -2205,9 +2295,11 @@ function Step-OdlSignatures {
     $script:OdlFilesToCopy = $files
     if ($files.Count -eq 0) { Write-Status 'SKIP' 'No ODL log files found.'; return }
 
-    # Words to look for. "Strong" words usually point to a real sync fault.
-    $strong = @('FileSyncError', 'RecordFileSyncError', 'UpdatePHState', 'PostponedFailure', 'UnexpectedFailure', 'AccessDenied', 'ACCESS_DENIED',
-        'Unauthorized', 'Forbidden', 'Throttl', 'QuotaExceeded', 'OverQuota', 'StorageFull', 'SiteLocked', 'ItemLocked', 'NameConflict', 'InvalidName', 'PathTooLong', 'DiskFull', 'NoSpace')
+    # Words to look for. "Strong" words usually point to a real sync fault and are marked for review.
+    # UnexpectedFailure and Throttl are still counted but not marked: field testing showed them in large numbers
+    # in healthy logs (UI telemetry and code names such as ShouldThrottleRequestInternal).
+    $strong = @('FileSyncError', 'RecordFileSyncError', 'UpdatePHState', 'PostponedFailure', 'AccessDenied', 'ACCESS_DENIED',
+        'Unauthorized', 'Forbidden', 'QuotaExceeded', 'OverQuota', 'StorageFull', 'SiteLocked', 'ItemLocked', 'NameConflict', 'InvalidName', 'PathTooLong', 'DiskFull', 'NoSpace')
     $pattern = '(FileSyncError|RecordFileSyncError|UpdatePHState|PostponedFailure|UnexpectedFailure|Failure|AccessDenied|ACCESS_DENIED|Unauthorized|Forbidden|Throttl|QuotaExceeded|OverQuota|StorageFull|SiteLocked|ItemLocked|NameConflict|InvalidName|PathTooLong|DiskFull|NoSpace|0x8[0-9A-Fa-f]{7}|0xC[0-9A-Fa-f]{7})'
     $kwRx = New-Object System.Text.RegularExpressions.Regex($pattern)
     $leftRx = New-Object System.Text.RegularExpressions.Regex('[\x20-\x7E]*', [System.Text.RegularExpressions.RegexOptions]::RightToLeft)
@@ -2437,7 +2529,7 @@ function Step-Report {
     }
 
     # Detailed fix steps for findings that have them.
-    foreach ($f in @($sorted | Where-Object { $_.Status -eq 'FAIL' -or $_.Status -eq 'WARN' })) {
+    foreach ($f in @($sorted | Where-Object { $_.Status -eq 'FAIL' })) {
         $steps = @(Get-FixSteps -Check $f.Check)
         if ($steps.Count -gt 0) { foreach ($line in $steps) { [void]$s.Add($line) }; [void]$s.Add('') }
     }
@@ -2638,8 +2730,9 @@ $shown = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -or $_.Status 
 foreach ($f in $shown) { Write-Host ('    [{0}] {1}: {2}' -f $f.Status, $f.Check, $f.Detail) -ForegroundColor $(if ($f.Status -eq 'FAIL') { 'Red' } else { 'Yellow' }) }
 if ($script:ZipKeepFolder -or -not $script:DoZip) { Write-Host ('  Folder : {0}' -f $script:OutDir) }
 if ($script:ZipPath) { Write-Host ('  Zip    : {0}' -f $script:ZipPath) }
-# Fix steps for findings that need more than one line, so the helpdesk sees them without opening the summary.
-foreach ($f in $shown) {
+# Fix steps for FAIL findings that need more than one line, so the helpdesk sees them without opening the summary.
+# (Not for WARN: field testing showed an isolated warning printing a long fix block was noise.)
+foreach ($f in @($shown | Where-Object { $_.Status -eq 'FAIL' })) {
     $steps = @(Get-FixSteps -Check $f.Check)
     if ($steps.Count -gt 0) {
         Write-Host ''
@@ -2647,7 +2740,7 @@ foreach ($f in $shown) {
         foreach ($line in ($steps | Select-Object -Skip 1)) { Write-Host $line }
     }
 }
-if ($shown.Count -gt 0) { Write-Host '' }
+if (@($shown | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { Write-Host '' }
 Write-Host '  Next   : open 00_Summary.txt first. Attach the zip (or folder) to the ticket.'
 Write-Host '  Note   : the package contains file and folder names. Handle it as confidential.' -ForegroundColor DarkGray
 if ($OpenOutput.IsPresent) {
