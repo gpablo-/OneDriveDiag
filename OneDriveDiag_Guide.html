@@ -72,10 +72,11 @@ footer{padding:20px 40px;color:#6b5f55;font-size:13px;border-top:1px solid #e3d9
 <li>Get <code>OneDriveDiag.ps1</code> onto the PC in <code>C:\temp</code>. Either copy it there, or download the latest version from GitHub by pasting this into Windows PowerShell:
 <pre><code>if (-not (Test-Path 'C:\Temp')) { New-Item -ItemType Directory -Path 'C:\Temp' | Out-Null }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/gpablo-/OneDriveDiag/main/OneDriveDiag.ps1' -OutFile 'C:\Temp\OneDriveDiag.ps1' -UseBasicParsing
+Remove-Item -LiteralPath 'C:\Temp\OneDriveDiag.ps1' -Force -ErrorAction SilentlyContinue
+Invoke-WebRequest -Uri ('https://raw.githubusercontent.com/gpablo-/OneDriveDiag/main/OneDriveDiag.ps1?t=' + [DateTime]::UtcNow.Ticks) -OutFile 'C:\Temp\OneDriveDiag.ps1' -UseBasicParsing
 Unblock-File -Path 'C:\Temp\OneDriveDiag.ps1'
 Get-Item 'C:\Temp\OneDriveDiag.ps1' | Select-Object FullName, Length, LastWriteTime</code></pre>
-This creates <code>C:\Temp</code> if it is missing, turns on TLS 1.2 (older Windows PowerShell 5.1 builds need it to reach GitHub), downloads the script, removes the "downloaded from the internet" block, and shows the file so you can confirm it arrived (about 140 KB). Use the raw.githubusercontent.com link, not the github.com/.../blob/... page link, which downloads a web page instead of the script.</li>
+This creates <code>C:\Temp</code> if it is missing, turns on TLS 1.2 (older Windows PowerShell 5.1 builds need it to reach GitHub), removes any older copy (even if it is read-only), downloads the latest script, removes the "downloaded from the internet" block, and shows the file so you can confirm it arrived (about 150 KB). The <code>?t=</code> value on the link stops a cached older copy being served. Use the raw.githubusercontent.com link, not the github.com/.../blob/... page link, which downloads a web page instead of the script.</li>
 <li>Open Windows PowerShell. Run:
 <pre><code>powershell.exe -ExecutionPolicy Bypass -File C:\temp\OneDriveDiag.ps1</code></pre></li>
 <li>Answer the questions on screen. Press Enter to accept the default (shown as "default"). Standard is the usual choice.</li>
