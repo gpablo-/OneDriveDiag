@@ -64,6 +64,12 @@
 .PARAMETER PathWarnLength
     Local path length flagged as too long. Default 260 (the classic Windows MAX_PATH limit).
 
+.PARAMETER PendingUploadMinutes
+    A file inside a sync folder that is still a normal local file (not yet a OneDrive placeholder) and was last
+    changed more than this many minutes ago is reported as "waiting to upload". It counts towards the
+    "items not in sync" result, because File Explorer shows it as pending or with a red cross. Files OneDrive
+    never uploads are ignored: desktop.ini, thumbs.db, .ds_store, Office owner files (~$...), .tmp and .lock. Default 15.
+
 .PARAMETER ServerPathWarnLength
     Estimated SharePoint path length flagged as near the 400 character limit. Default 360.
 
@@ -162,6 +168,8 @@ param(
     [int]$PathWarnLength = 260,
 
     [int]$ServerPathWarnLength = 360,
+
+    [int]$PendingUploadMinutes = 15,
 
     [int]$EventDays = 7,
 
@@ -1798,6 +1806,12 @@ function Invoke-FolderIndex {
     # "In sync" state per placeholder (Cloud Files API). Items NOT in sync are the ones behind red cross icons.
     $syncReady = Initialize-SyncStateApi
     [long]$syncChecked = 0; [long]$syncIn = 0; [long]$syncNot = 0; [long]$syncOpenFail = 0
+    # Local files that have waited longer than -PendingUploadMinutes to upload (they are not placeholders, so the
+    # Cloud Files check cannot see them, but File Explorer shows them as pending or with a red cross).
+    [long]$pendingStale = 0; [double]$pendingOldest = 0
+    $nowUtc = [datetime]::UtcNow
+    # Names OneDrive never uploads: Windows and macOS folder files, Office owner files (~$), temp and lock files.
+    $neverUploadRx = New-Object System.Text.RegularExpressions.Regex('^(desktop\.ini|thumbs\.db|ehthumbs\.db|\.ds_store)$|^~\$|\.(tmp|lock)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
     function Add-ScanException {
         # Counts a problem item and writes a row until the per-category limit is reached.
@@ -1877,7 +1891,18 @@ function Invoke-FolderIndex {
 
                         if (($attr -band 0x400) -eq 0) {
                             # No reparse point: OneDrive does not manage this file as a placeholder (new local file, or not tracked).
-                            if (($attr -band 6) -ne 6) { $localOnly++; $agg[6]++; Add-ScanException 'FileNotCloudManaged' $full $attr $len $e.LastWriteTimeUtc $plen 0 }
+                            if (($attr -band 6) -ne 6) {
+                                $localOnly++; $agg[6]++
+                                # Changed longer ago than -PendingUploadMinutes and still not uploaded: OneDrive is stuck on it
+                                # (usually because the file is open). Files OneDrive never uploads are not counted.
+                                $ageMin = ($nowUtc - $e.LastWriteTimeUtc).TotalMinutes
+                                if ($ageMin -ge $PendingUploadMinutes -and -not $neverUploadRx.IsMatch($name)) {
+                                    $pendingStale++
+                                    if ($ageMin -gt $pendingOldest) { $pendingOldest = $ageMin }
+                                    Add-ScanException 'WaitingToUpload' $full $attr $len $e.LastWriteTimeUtc $plen 0 ('Changed {0:N0} minutes ago and not uploaded' -f $ageMin)
+                                }
+                                else { Add-ScanException 'FileNotCloudManaged' $full $attr $len $e.LastWriteTimeUtc $plen 0 }
+                            }
                             else { $systemHidden++ }
                         }
                         elseif (($attr -band $recallMask) -ne 0) {
@@ -1994,6 +2019,7 @@ function Invoke-FolderIndex {
         [void]$s.Add(('  NOT in sync      : {0:N0}   (listed as NotInSync in the exceptions CSV)' -f $syncNot))
         if ($syncOpenFail -gt 0) { [void]$s.Add(('  Could not open   : {0:N0}   (locked, removed during the scan, or access denied)' -f $syncOpenFail)) }
     }
+    [void]$s.Add(('  Waiting to upload: {0:N0}   (local files changed more than {1} minutes ago and not uploaded; WaitingToUpload in the exceptions CSV{2})' -f $pendingStale, $PendingUploadMinutes, $(if ($pendingStale -gt 0) { ('; oldest {0:N0} minutes' -f $pendingOldest) } else { '' })))
     [void]$s.Add(('Longest local path  : {0} characters  {1}' -f $maxLocal, $maxLocalPath))
     if ($serverPrefix -ge 0) { [void]$s.Add(('Longest server path : {0} characters (estimate)  {1}' -f $maxServer, $maxServerPath)) }
     [void]$s.Add('')
@@ -2035,6 +2061,7 @@ function Invoke-FolderIndex {
         LocallyAvailable = $locallyAvail; MaxLocalPath = $maxLocal; MaxServerPath = $maxServer
         ReparseOther = $reparseOther; ReparseChecked = $reparseChecked; ExceptionFile = $excPath; IndexFile = $idxPath
         SyncChecked = $syncChecked; SyncNot = $syncNot; SyncOpenFail = $syncOpenFail; SyncReady = $syncReady
+        PendingStale = $pendingStale; PendingOldestMin = $pendingOldest
     }
 }
 
@@ -2064,18 +2091,28 @@ function Add-ScanFindings {
     if ($c -gt 0) { Add-Finding 'File index' ('SharePoint path near limit: ' + $t) 'WARN' ('{0:N0} item(s) are within reach of the 400 character limit (from {1}).' -f $c, $ServerPathWarnLength) 'Long paths often fail when an extra sub folder or longer name is added.' }
     $c = Get-Count 'LocalPathLength'
     if ($c -gt 0) { Add-Finding 'File index' ('Local path length: ' + $t) 'WARN' ('{0:N0} item(s) have a local path of {1} characters or more. Longest {2}.' -f $c, $PathWarnLength, $R.MaxLocalPath) 'OneDrive itself syncs these, but apps may not open or save them (desktop Excel fails above 218 characters in the full path). This is a usability risk, not usually a sync fault. Shorter folder names help.' }
+    # Local files changed within the last -PendingUploadMinutes: normal, about to upload.
     $c = Get-Count 'FileNotCloudManaged'
-    if ($c -gt 25) { Add-Finding 'File index' ('Files not managed by OneDrive: ' + $t) 'WARN' ('{0:N0} file(s) are normal local files with no OneDrive placeholder state.' -f $c) 'These may be new files waiting to sync, or files OneDrive is not tracking. Check them in the exceptions CSV.' }
-    elseif ($c -gt 0) { Add-Finding 'File index' ('Files not managed by OneDrive: ' + $t) 'INFO' ('{0:N0} file(s) are normal local files with no placeholder state.' -f $c) 'Often new or recently saved files that are about to sync.' }
+    if ($c -gt 0) { Add-Finding 'File index' ('Files about to upload: ' + $t) 'INFO' ('{0:N0} file(s) were changed in the last {1} minutes, or are files OneDrive never uploads (desktop.ini, lock or temp files), and are not uploaded.' -f $c, $PendingUploadMinutes) 'Normal for recently saved files. Listed as FileNotCloudManaged in the exceptions CSV.' }
     $c = Get-Count 'FolderNotCloudManaged'
     if ($c -gt 0) { Add-Finding 'File index' ('Folders not managed by OneDrive: ' + $t) 'INFO' ('{0:N0} folder(s) are normal local folders.' -f $c) 'New local folders appear here until OneDrive picks them up.' }
-    if ($R.SyncReady) {
-        if ($R.SyncNot -gt 0) {
-            Add-Finding 'File index' ('Items not in sync: ' + $t) 'WARN' ('{0:N0} of {1:N0} OneDrive item(s) are NOT marked in sync. These are the items behind red cross or sync-pending icons; their parent folders show the cross too.' -f $R.SyncNot, $R.SyncChecked) 'See the NotInSync rows in the exceptions CSV for the exact items. Ask the user to close the apps that use them (Office, Outlook, Explorer preview pane), then restart OneDrive and check again. If the same items stay not in sync, check them in SharePoint (permissions, checked out, retention or site lock).'
-        }
-        else {
-            Add-Finding 'File index' ('Items in sync: ' + $t) 'PASS' ('All {0:N0} OneDrive item(s) checked are marked in sync.' -f $R.SyncChecked)
-        }
+
+    # The in sync verdict. Two kinds of item show as pending or with a red cross in File Explorer:
+    #   1. placeholders whose "in sync" mark is not set (Cloud Files check), and
+    #   2. local files that have waited longer than -PendingUploadMinutes to upload (not placeholders yet, so the check cannot see them).
+    $parts = @()
+    if ($R.SyncReady -and $R.SyncNot -gt 0) { $parts += ('{0:N0} OneDrive item(s) are NOT marked in sync' -f $R.SyncNot) }
+    if ($R.PendingStale -gt 0) {
+        $old = [double]$R.PendingOldestMin
+        $oldText = '{0:N0} minutes' -f $old
+        if ($old -ge 2880) { $oldText = '{0:N0} days' -f ($old / 1440) } elseif ($old -ge 120) { $oldText = '{0:N1} hours' -f ($old / 60) }
+        $parts += ('{0:N0} changed file(s) have waited more than {1} minutes to upload (oldest {2})' -f $R.PendingStale, $PendingUploadMinutes, $oldText)
+    }
+    if ($parts.Count -gt 0) {
+        Add-Finding 'File index' ('Items not in sync: ' + $t) 'WARN' (($parts -join '; ') + '. These are the items behind red cross or sync-pending icons; their parent folders show the cross too.') 'See the NotInSync and WaitingToUpload rows in the exceptions CSV for the exact items. Files waiting to upload are usually still open: ask the user to save and close them (Office, Outlook) and close the Explorer preview pane, then restart OneDrive and check again. If an item stays stuck, open the OneDrive cloud icon > View sync problems for the exact error, and check the item in SharePoint (permissions, checked out, retention or site lock).'
+    }
+    elseif ($R.SyncReady) {
+        Add-Finding 'File index' ('Items in sync: ' + $t) 'PASS' ('All {0:N0} OneDrive item(s) checked are marked in sync, and no changed files are waiting to upload.' -f $R.SyncChecked)
     }
     $c = Get-Count 'NonCloudReparseFolder'
     if ($c -gt 0) { Add-Finding 'File index' ('Junctions or links: ' + $t) 'WARN' ('{0:N0} sampled folder(s) are not cloud placeholders (junction or symbolic link).' -f $c) 'OneDrive does not follow links reliably. Review these in the exceptions CSV.' }
@@ -2561,7 +2598,7 @@ function Step-Report {
         Elevated = $script:IsElevated; Unattended = $script:IsUnattended
         Parameters = [ordered]@{ OutputRoot = $OutputRoot; SyncRoot = ($SyncRoot -join ';'); FocusPath = $FocusPath; LargeDatasetAction = $LargeDatasetAction
             LargeDatasetThreshold = $LargeDatasetThreshold; ScanTimeLimitMinutes = $ScanTimeLimitMinutes; PathWarnLength = $PathWarnLength
-            ServerPathWarnLength = $ServerPathWarnLength; EventDays = $EventDays; OdlMaxFiles = $OdlMaxFiles; OdlMaxTotalMB = $OdlMaxTotalMB
+            ServerPathWarnLength = $ServerPathWarnLength; PendingUploadMinutes = $PendingUploadMinutes; EventDays = $EventDays; OdlMaxFiles = $OdlMaxFiles; OdlMaxTotalMB = $OdlMaxTotalMB
             FullIndex = $script:ScanFullIndex; RawLogs = $script:IncludeRaw }
         Counts = [ordered]@{ Fail = $nFail; Warn = $nWarn; Info = $nInfo; Pass = $nPass }
         Facts = $script:Facts
