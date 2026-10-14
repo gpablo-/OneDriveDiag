@@ -1,0 +1,13 @@
+# Normalize line endings in the repo; check out text files with CRLF (Windows-only project)
+* text=auto eol=crlf
+
+# PowerShell sources
+*.ps1    text eol=crlf
+*.psm1   text eol=crlf
+*.psd1   text eol=crlf
+*.ps1xml text eol=crlf
+
+# Binary
+*.zip binary
+*.png binary
+*.ico binary
