@@ -18,10 +18,13 @@ Full documentation: [OneDriveDiag_Guide.html](OneDriveDiag_Guide.html) (download
 
 Run these in Windows PowerShell **as the user who has the problem** (not as SYSTEM).
 
-**1. Download the latest version to `C:\Temp`** (creates the folder if needed and replaces any older copy):
+**1. Clean up and download the latest version to `C:\Temp`.** This creates the folder if needed, **deletes the
+results of previous runs** (`C:\Temp\onedrivediag_*` folders and zips; nothing else), and replaces any older copy
+of the script. Attach any result you still need to the ticket first.
 
 ```powershell
 if (-not (Test-Path 'C:\Temp')) { New-Item -ItemType Directory -Path 'C:\Temp' | Out-Null }
+Get-ChildItem -LiteralPath 'C:\Temp' -Filter 'onedrivediag_*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $_.FullName) { 'Could not remove ' + $_.Name } else { 'Removed ' + $_.Name } }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Remove-Item -LiteralPath 'C:\Temp\OneDriveDiag.ps1' -Force -ErrorAction SilentlyContinue
 Invoke-WebRequest -Uri ('https://raw.githubusercontent.com/gpablo-/OneDriveDiag/main/OneDriveDiag.ps1?t=' + [DateTime]::UtcNow.Ticks) -OutFile 'C:\Temp\OneDriveDiag.ps1' -UseBasicParsing

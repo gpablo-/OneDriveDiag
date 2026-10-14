@@ -69,8 +69,9 @@ footer{padding:20px 40px;color:#6b5f55;font-size:13px;border-top:1px solid #e3d9
 <h2 id="quickstart">2. Quick start for the helpdesk</h2>
 <ol>
 <li>Sign in as the user who has the problem, or open a shell in that user's context. Do not use SYSTEM.</li>
-<li>Get <code>OneDriveDiag.ps1</code> onto the PC in <code>C:\temp</code>. Either copy it there, or download the latest version from GitHub by pasting this into Windows PowerShell:
+<li>Get <code>OneDriveDiag.ps1</code> onto the PC in <code>C:\temp</code>. Either copy it there, or download the latest version from GitHub by pasting this into Windows PowerShell. <b>It first deletes the results of previous runs</b> (<code>C:\Temp\onedrivediag_*</code> folders and zips, nothing else), so attach any result you still need to the ticket before you run it:
 <pre><code>if (-not (Test-Path 'C:\Temp')) { New-Item -ItemType Directory -Path 'C:\Temp' | Out-Null }
+Get-ChildItem -LiteralPath 'C:\Temp' -Filter 'onedrivediag_*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $_.FullName) { 'Could not remove ' + $_.Name } else { 'Removed ' + $_.Name } }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Remove-Item -LiteralPath 'C:\Temp\OneDriveDiag.ps1' -Force -ErrorAction SilentlyContinue
 Invoke-WebRequest -Uri ('https://raw.githubusercontent.com/gpablo-/OneDriveDiag/main/OneDriveDiag.ps1?t=' + [DateTime]::UtcNow.Ticks) -OutFile 'C:\Temp\OneDriveDiag.ps1' -UseBasicParsing
