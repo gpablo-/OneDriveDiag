@@ -232,6 +232,9 @@ $script:OneDriveExe = $null       # path of the running (or installed) OneDrive.
 $script:CloudProtection = $null   # Defender cloud-delivered protection (MAPSReporting): 0 off, 1 basic, 2 advanced
 $script:SyncStateReady = $null    # $true when the Cloud Files "in sync" check is available (see Initialize-SyncStateApi)
 $script:SyncStateNote = ''
+$script:NativeReady = $false      # $true when the C# helper (in sync state and open-file lookup) is loaded
+$script:OdlErrorsExplained = @()  # OneDrive log error names with plain-language meaning (Step-OdlSignatures)
+$script:TicketNote = @()          # the helpdesk ticket note (Step-Report), also shown at the end of the run
 $script:CountFail = 0
 $script:CountWarn = 0
 $script:OutputParent = $null
@@ -408,7 +411,7 @@ function Select-FromListCore {
         return @($DefaultIndex)
     }
     Write-Host ''
-    Write-Host $Title -ForegroundColor Cyan
+    Write-Host $Title -ForegroundColor Green
     for ($i = 0; $i -lt $Options.Count; $i++) {
         $mark = ''
         if ((-not $Multiple) -and (($i + 1) -eq $DefaultIndex)) { $mark = '   (default)' }
@@ -489,9 +492,9 @@ function Read-TextCore {
 function Show-Banner {
     # Title and plain-language instructions shown before anything runs.
     Write-Host ''
-    Write-Host '==============================================================================' -ForegroundColor Cyan
+    Write-Host '==============================================================================' -ForegroundColor DarkGreen
     Write-Host ('  OneDriveDiag - OneDrive Diagnostic Collector  v{0}' -f $script:ScriptVersion) -ForegroundColor White
-    Write-Host '==============================================================================' -ForegroundColor Cyan
+    Write-Host '==============================================================================' -ForegroundColor DarkGreen
     Write-Host '  This tool collects information about OneDrive on this PC to help find sync faults.'
     Write-Host '  - It is READ-ONLY. It does not change, reset or repair anything.'
     Write-Host '  - It is safe to run while the user is working.'
@@ -1694,11 +1697,12 @@ function Initialize-SyncStateApi {
     # sync show the sync-pending or red cross icon, and folders above them show the cross too.
     # The item is opened for attribute reading only, as the reparse point itself, so nothing is downloaded.
     # Returns $true when the helper is ready. Needs FullLanguage mode (Add-Type); returns $false otherwise.
+    # The same helper also holds the Restart Manager reader used to find which app has a stuck file open
+    # ($script:NativeReady), which works even when -SkipSyncState is used.
     if ($null -ne $script:SyncStateReady) { return $script:SyncStateReady }
     $script:SyncStateReady = $false
-    if ($SkipSyncState.IsPresent) { $script:SyncStateNote = 'skipped (-SkipSyncState)'; return $false }
+    $script:NativeReady = $false
     if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { $script:SyncStateNote = 'skipped (PowerShell is not in FullLanguage mode)'; return $false }
-    if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\cldapi.dll'))) { $script:SyncStateNote = 'skipped (cldapi.dll not found)'; return $false }
     $code = @'
 using System;
 using System.Runtime.InteropServices;
@@ -1724,17 +1728,67 @@ namespace OneDriveDiag {
             }
         }
     }
+
+    // Asks the Windows Restart Manager which running programs have a file open. This is the same feature
+    // Windows Update and installers use. It reads process information only: the file is not opened or downloaded.
+    // Without admin rights it sees the current user's programs, which is what matters for OneDrive.
+    public static class FileLocks {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType; public uint AppStatus; public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmStartSession(out uint handle, int flags, System.Text.StringBuilder key);
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmEndSession(uint handle);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmRegisterResources(uint handle, uint nFiles, string[] files, uint nApps, IntPtr apps, uint nServices, string[] services);
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmGetList(uint handle, out uint needed, ref uint count, [In, Out] RM_PROCESS_INFO[] info, ref uint reasons);
+
+        // Returns "AppName (pid 1234)" for each program holding the file open, or an empty array.
+        public static string[] Get(string path) {
+            uint handle;
+            if (RmStartSession(out handle, 0, new System.Text.StringBuilder(64)) != 0) { return new string[0]; }
+            try {
+                if (RmRegisterResources(handle, 1, new string[] { path }, 0, IntPtr.Zero, 0, null) != 0) { return new string[0]; }
+                uint needed = 0, count = 0, reasons = 0;
+                int rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+                if (rc != 234 || needed == 0) { return new string[0]; }   // 234 = ERROR_MORE_DATA: there are programs to list
+                RM_PROCESS_INFO[] info = new RM_PROCESS_INFO[needed];
+                count = needed;
+                if (RmGetList(handle, out needed, ref count, info, ref reasons) != 0) { return new string[0]; }
+                string[] result = new string[count];
+                for (int i = 0; i < count; i++) {
+                    string name = info[i].strAppName;
+                    try { name = System.Diagnostics.Process.GetProcessById(info[i].Process.dwProcessId).ProcessName + ".exe"; } catch { }
+                    result[i] = name + " (pid " + info[i].Process.dwProcessId + ")";
+                }
+                return result;
+            }
+            finally { RmEndSession(handle); }
+        }
+    }
 }
 '@
     try {
         if (-not ('OneDriveDiag.SyncState' -as [type])) { Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop }
-        $script:SyncStateReady = $true
-        $script:SyncStateNote = 'checked with the Cloud Files API'
+        $script:NativeReady = $true
     }
     catch {
         $script:SyncStateNote = 'skipped (helper could not be loaded: ' + $_.Exception.Message + ')'
-        Write-Log ('Sync state check unavailable: ' + $_.Exception.Message) 'WARN'
+        Write-Log ('Native helper unavailable: ' + $_.Exception.Message) 'WARN'
+        return $false
     }
+    if ($SkipSyncState.IsPresent) { $script:SyncStateNote = 'skipped (-SkipSyncState)' }
+    elseif (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\cldapi.dll'))) { $script:SyncStateNote = 'skipped (cldapi.dll not found)' }
+    else { $script:SyncStateReady = $true; $script:SyncStateNote = 'checked with the Cloud Files API' }
     return $script:SyncStateReady
 }
 
@@ -1810,6 +1864,31 @@ function Invoke-FolderIndex {
     # Cloud Files check cannot see them, but File Explorer shows them as pending or with a red cross).
     [long]$pendingStale = 0; [double]$pendingOldest = 0
     $nowUtc = [datetime]::UtcNow
+    # Where the stuck items are: counts per folder, one and two levels below the scanned path.
+    # Key = relative folder, value = long[2] (0 = not in sync, 1 = waiting to upload).
+    $hotspots = @{}
+    $startLen = ($prefix + $StartPath).Length + 1
+    # Stuck files whose open-by program is looked up after the scan (Restart Manager), capped to keep it quick.
+    $lockCandidates = New-Object System.Collections.ArrayList
+    $lockMax = 50
+    function Add-Hotspot {
+        # Adds one stuck item to the per-folder counts. Kind 0 = not in sync, 1 = waiting to upload.
+        param([string]$FullPath, [int]$Kind, [bool]$IsFolder)
+        $rel = ''
+        if ($FullPath.Length -gt $startLen) { $rel = $FullPath.Substring($startLen) }
+        $parts = $rel.Split('\')
+        # A file's own name is not a folder level; a folder counts as its own location.
+        $levels = $parts.Count
+        if (-not $IsFolder) { $levels = $parts.Count - 1 }
+        $keys = @('(scanned folder itself)')
+        if ($levels -ge 1) { $keys = @($parts[0]) }
+        if ($levels -ge 2) { $keys += ($parts[0] + '\' + $parts[1]) }
+        foreach ($k in $keys) {
+            $v = $hotspots[$k]
+            if ($null -eq $v) { $v = New-Object 'long[]' 2; $hotspots[$k] = $v }
+            $v[$Kind]++
+        }
+    }
     # Names OneDrive never uploads: Windows and macOS folder files, Office owner files (~$), temp and lock files.
     $neverUploadRx = New-Object System.Text.RegularExpressions.Regex('^(desktop\.ini|thumbs\.db|ehthumbs\.db|\.ds_store)$|^~\$|\.(tmp|lock)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
@@ -1899,6 +1978,8 @@ function Invoke-FolderIndex {
                                 if ($ageMin -ge $PendingUploadMinutes -and -not $neverUploadRx.IsMatch($name)) {
                                     $pendingStale++
                                     if ($ageMin -gt $pendingOldest) { $pendingOldest = $ageMin }
+                                    Add-Hotspot $full 1 $false
+                                    if ($lockCandidates.Count -lt $lockMax) { [void]$lockCandidates.Add([pscustomobject]@{ Path = $full.Substring($prefixLen); State = 'WaitingToUpload' }) }
                                     Add-ScanException 'WaitingToUpload' $full $attr $len $e.LastWriteTimeUtc $plen 0 ('Changed {0:N0} minutes ago and not uploaded' -f $ageMin)
                                 }
                                 else { Add-ScanException 'FileNotCloudManaged' $full $attr $len $e.LastWriteTimeUtc $plen 0 }
@@ -1942,6 +2023,8 @@ function Invoke-FolderIndex {
                         elseif ($ss -eq 0) {
                             $syncChecked++; $syncNot++
                             $len0 = 0; if (-not $isDir) { $len0 = [long]$e.Length }
+                            Add-Hotspot $full 0 $isDir
+                            if (-not $isDir -and $lockCandidates.Count -lt $lockMax) { [void]$lockCandidates.Add([pscustomobject]@{ Path = $full.Substring($prefixLen); State = 'NotInSync' }) }
                             Add-ScanException 'NotInSync' $full $attr $len0 $e.LastWriteTimeUtc $plen 0 $(if ($isDir) { 'Folder' } else { 'File' })
                         }
                         elseif ($ss -eq -2) { $syncOpenFail++ }
@@ -1990,6 +2073,32 @@ function Invoke-FolderIndex {
     }
     $sw.Stop()
 
+    # ---------- WHO HAS THE STUCK FILES OPEN (Restart Manager) ----------
+    # A file that will not upload or will not get its in sync mark is usually held open by a program.
+    $openRows = New-Object System.Collections.ArrayList
+    $openApps = @{}
+    $lockNote = ''
+    if ($lockCandidates.Count -gt 0) {
+        if ($script:NativeReady) {
+            foreach ($lc in $lockCandidates) {
+                $holders = @()
+                try { $holders = @([OneDriveDiag.FileLocks]::Get($lc.Path)) } catch { }
+                if ($holders.Count -gt 0) {
+                    foreach ($h in $holders) { $app = ($h -split ' \(pid ')[0]; $openApps[$app] = 1 + [int]$openApps[$app] }
+                }
+                [void]$openRows.Add([pscustomobject]@{ State = $lc.State; OpenBy = $(if ($holders.Count) { $holders -join '; ' } else { '(not open)' }); Path = $lc.Path })
+            }
+            Save-Csv ('11_FileSystem_{0}_OpenFiles.csv' -f $Label) $openRows
+        }
+        else { $lockNote = 'Open-file lookup skipped: PowerShell is not in FullLanguage mode.' }
+    }
+
+    # Hotspot rows, worst first.
+    $hotRows = @($hotspots.GetEnumerator() | ForEach-Object {
+            [pscustomobject]@{ Folder = $_.Key; Level = $(if ($_.Key -like '*\*') { 2 } else { 1 }); NotInSync = $_.Value[0]; WaitingToUpload = $_.Value[1]; Total = $_.Value[0] + $_.Value[1] }
+        } | Sort-Object -Property @(@{ Expression = 'Total'; Descending = $true }, @{ Expression = 'Folder'; Descending = $false }))
+    if ($hotRows.Count -gt 0) { Save-Csv ('11_FileSystem_{0}_Hotspots.csv' -f $Label) $hotRows }
+
     # ---------- WRITE THE SUMMARY FILE ----------
     $secsTotal = [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
     $s = New-Object System.Collections.ArrayList
@@ -2020,6 +2129,22 @@ function Invoke-FolderIndex {
         if ($syncOpenFail -gt 0) { [void]$s.Add(('  Could not open   : {0:N0}   (locked, removed during the scan, or access denied)' -f $syncOpenFail)) }
     }
     [void]$s.Add(('  Waiting to upload: {0:N0}   (local files changed more than {1} minutes ago and not uploaded; WaitingToUpload in the exceptions CSV{2})' -f $pendingStale, $PendingUploadMinutes, $(if ($pendingStale -gt 0) { ('; oldest {0:N0} minutes' -f $pendingOldest) } else { '' })))
+    if ($hotRows.Count -gt 0) {
+        [void]$s.Add('')
+        [void]$s.Add('WHERE THE STUCK ITEMS ARE (these folders show the red cross; full list in the Hotspots CSV)')
+        [void]$s.Add(('  {0,-70} {1,10} {2,10}' -f 'Folder (relative to the scanned path)', 'NotInSync', 'Waiting'))
+        foreach ($h in ($hotRows | Select-Object -First 25)) {
+            $nm = '  ' * ($h.Level - 1) + $h.Folder
+            if ($nm.Length -gt 70) { $nm = '...' + $nm.Substring($nm.Length - 67) }
+            [void]$s.Add(('  {0,-70} {1,10:N0} {2,10:N0}' -f $nm, $h.NotInSync, $h.WaitingToUpload))
+        }
+    }
+    if ($openRows.Count -gt 0 -or $lockNote) {
+        [void]$s.Add('')
+        [void]$s.Add(('OPEN BY (stuck files checked: {0}, maximum {1}; full list in the OpenFiles CSV)' -f $lockCandidates.Count, $lockMax))
+        if ($lockNote) { [void]$s.Add('  ' + $lockNote) }
+        foreach ($r in ($openRows | Select-Object -First 25)) { [void]$s.Add(('  {0,-16} {1,-30} {2}' -f $r.State, $r.OpenBy, $r.Path)) }
+    }
     [void]$s.Add(('Longest local path  : {0} characters  {1}' -f $maxLocal, $maxLocalPath))
     if ($serverPrefix -ge 0) { [void]$s.Add(('Longest server path : {0} characters (estimate)  {1}' -f $maxServer, $maxServerPath)) }
     [void]$s.Add('')
@@ -2062,6 +2187,7 @@ function Invoke-FolderIndex {
         ReparseOther = $reparseOther; ReparseChecked = $reparseChecked; ExceptionFile = $excPath; IndexFile = $idxPath
         SyncChecked = $syncChecked; SyncNot = $syncNot; SyncOpenFail = $syncOpenFail; SyncReady = $syncReady
         PendingStale = $pendingStale; PendingOldestMin = $pendingOldest
+        Hotspots = $hotRows; OpenFiles = @($openRows); OpenApps = $openApps; StartPath = $StartPath
     }
 }
 
@@ -2109,7 +2235,12 @@ function Add-ScanFindings {
         $parts += ('{0:N0} changed file(s) have waited more than {1} minutes to upload (oldest {2})' -f $R.PendingStale, $PendingUploadMinutes, $oldText)
     }
     if ($parts.Count -gt 0) {
-        Add-Finding 'File index' ('Items not in sync: ' + $t) 'WARN' (($parts -join '; ') + '. These are the items behind red cross or sync-pending icons; their parent folders show the cross too.') 'See the NotInSync and WaitingToUpload rows in the exceptions CSV for the exact items. Files waiting to upload are usually still open: ask the user to save and close them (Office, Outlook) and close the Explorer preview pane, then restart OneDrive and check again. If an item stays stuck, open the OneDrive cloud icon > View sync problems for the exact error, and check the item in SharePoint (permissions, checked out, retention or site lock).'
+        $where = ''
+        $top = @($R.Hotspots | Where-Object { $_.Level -eq 1 } | Select-Object -First 4)
+        if ($top.Count -gt 0) { $where = ' Folders: ' + (($top | ForEach-Object { '{0} ({1})' -f $_.Folder, $_.Total }) -join ', ') + '.' }
+        $openText = ''
+        if ($R.OpenApps -and $R.OpenApps.Count -gt 0) { $openText = ' Open in: ' + (($R.OpenApps.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { '{0} ({1} file(s))' -f $_.Key, $_.Value }) -join ', ') + '.' }
+        Add-Finding 'File index' ('Items not in sync: ' + $t) 'WARN' (($parts -join '; ') + '.' + $where + $openText + ' These are the items behind red cross or sync-pending icons; their parent folders show the cross too.') 'See the NotInSync and WaitingToUpload rows in the exceptions CSV for the exact items. Files waiting to upload are usually still open: ask the user to save and close them (Office, Outlook) and close the Explorer preview pane, then restart OneDrive and check again. If an item stays stuck, open the OneDrive cloud icon > View sync problems for the exact error, and check the item in SharePoint (permissions, checked out, retention or site lock).'
     }
     elseif ($R.SyncReady) {
         Add-Finding 'File index' ('Items in sync: ' + $t) 'PASS' ('All {0:N0} OneDrive item(s) checked are marked in sync, and no changed files are waiting to upload.' -f $R.SyncChecked)
@@ -2326,6 +2457,44 @@ function Read-OdlText {
     }
 }
 
+function Get-OdlErrorMeaning {
+    # Plain-language meaning and action for a OneDrive log error name (the part after ErrorCode::).
+    # Exact names first (confirmed in field use), then rules based on words in the name.
+    param([string]$Name)
+    $exact = @{
+        'UpdatePHStateSetInSyncBitFSPostponed' = 'OneDrive could not mark an item as in sync in Windows and will retry. Usually the item was open in another app (Office, Outlook, Explorer preview). This is what leaves red crosses on folders whose content is fine. Action: close the app, restart OneDrive.'
+        'PostponedRetryComplete'               = 'An operation OneDrive had postponed was retried and finished. On its own this means the earlier error cleared. Action: none, unless it repeats for the same item.'
+    }
+    if ($exact.ContainsKey($Name)) { return $exact[$Name] }
+    $rules = @(
+        @('AccessDenied|Unauthori|Forbidden|Permission', 'Permission problem: the user cannot change this item in SharePoint (read-only access, broken inheritance) or Windows denied access locally. Action: check the item permissions in SharePoint.'),
+        @('Quota|StorageFull|DiskFull|NoSpace', 'Storage is full: the SharePoint site or OneDrive quota, or the local disk. Action: check site storage in SharePoint admin and local free space.'),
+        @('Lock|CheckedOut|CheckOut', 'The item is locked or checked out (in SharePoint, by retention, or open by someone else). Action: check it in, close it, or check retention and site lock in SharePoint.'),
+        @('PathTooLong|NameTooLong|InvalidName|InvalidPath|NameConflict', 'Name or path problem: too long, a character or name SharePoint rejects, or two items with the same name. Action: rename or shorten.'),
+        @('Hash|Mismatch', 'The file changed while it was being uploaded or downloaded, so its check value did not match. Action: usually retries on its own; close the file if it repeats.'),
+        @('Throttl|TooManyRequests|ServerBusy', 'Microsoft 365 asked OneDrive to slow down (throttling). Action: none; it retries. Very large libraries make this more likely.'),
+        @('Network|Connect|Timeout|Proxy|Dns|Offline', 'Network problem reaching Microsoft 365. Action: see 08_Network_Endpoints.csv and the proxy settings.'),
+        @('Auth|Token|SignIn|Credential', 'Sign-in or token problem. Action: check the Primary Refresh Token finding and ask the user to sign in to OneDrive again if prompted.'),
+        @('Postpone|Retry|Deferred', 'OneDrive postponed an operation and will retry it. Action: none on its own; look at what else is reported for the same time.')
+    )
+    foreach ($r in $rules) { if ($Name -match $r[0]) { return $r[1] } }
+    return 'Not in the tool''s list. Note the name for escalation; searching it often finds the cause.'
+}
+
+function Get-HexErrorMeaning {
+    # Windows' own description of an error code such as 0x80070005, or $null when Windows does not know it.
+    param([string]$Hex)
+    try {
+        $u = [Convert]::ToUInt32($Hex.Substring(2), 16)
+        $code = [BitConverter]::ToInt32([BitConverter]::GetBytes($u), 0)
+        if (($u -band 0xFFFF0000) -eq 0x80070000) { $code = [int]($u -band 0xFFFF) }   # HRESULT wrapping a Win32 error
+        $msg = (New-Object System.ComponentModel.Win32Exception($code)).Message
+        if ($msg -match '^Unknown error') { return $null }
+        return $msg
+    }
+    catch { return $null }
+}
+
 function Step-OdlSignatures {
     # STEP: Scan the newest ODL files for error text and summarise it.
     $files = @(Get-OdlFileSet)
@@ -2343,6 +2512,9 @@ function Step-OdlSignatures {
     $rightRx = New-Object System.Text.RegularExpressions.Regex('^[\x20-\x7E]*')
 
     $kwCounts = @{}
+    $errNames = @{}     # OneDrive error names (text after ErrorCode::) -> count
+    $hexCounts = @{}    # hex error codes -> count
+    $errRx = New-Object System.Text.RegularExpressions.Regex('ErrorCode::([A-Za-z][A-Za-z0-9]{3,80})')
     $sigCounts = @{}
     $sigFile = @{}
     $overflow = 0
@@ -2361,7 +2533,7 @@ function Step-OdlSignatures {
         foreach ($m in $kwRx.Matches($text)) {
             $nMatch++
             $kw = $m.Groups[1].Value
-            if ($kw -match '^0x') { $kw = 'HexErrorCode' }
+            if ($kw -match '^0x') { $hx = $kw.ToUpperInvariant().Replace('0X', '0x'); $hexCounts[$hx] = 1 + [long]$hexCounts[$hx]; $kw = 'HexErrorCode' }
             $kwCounts[$kw] = 1 + [long]$kwCounts[$kw]
             # Build a readable snippet around the match (printable characters only). Capped at 60,000 per file.
             if ($nMatch -le 60000 -and $m.Index -ge $lastEnd) {
@@ -2381,6 +2553,8 @@ function Step-OdlSignatures {
                 else { $overflow++ }
             }
         }
+        # Error names are counted separately so they can be explained in plain language.
+        foreach ($em in $errRx.Matches($text)) { $en = $em.Groups[1].Value; $errNames[$en] = 1 + [long]$errNames[$en] }
         $text = $null
         [GC]::Collect()
     }
@@ -2405,6 +2579,30 @@ function Step-OdlSignatures {
         [void]$o.Add(('{0,8:N0}  [{1}]  {2}' -f $kv.Value, $sigFile[$kv.Key], $kv.Key))
     }
     if ($overflow -gt 0) { [void]$o.Add(('(More than 4000 different signatures. {0:N0} further snippets were not stored.)' -f $overflow)) }
+
+    # Plain-language explanations. Placed first in the file so the helpdesk reads them before the raw counts.
+    $explain = New-Object System.Collections.ArrayList
+    $script:OdlErrorsExplained = @()
+    if ($errNames.Count -gt 0) {
+        [void]$explain.Add('ONEDRIVE ERRORS EXPLAINED (text after ErrorCode:: in the logs)')
+        foreach ($kv in ($errNames.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 20)) {
+            $meaning = Get-OdlErrorMeaning -Name $kv.Key
+            [void]$explain.Add(('  {0}  x{1:N0}' -f $kv.Key, $kv.Value))
+            [void]$explain.Add('      ' + $meaning)
+            $script:OdlErrorsExplained += [pscustomobject]@{ Name = $kv.Key; Count = $kv.Value; Meaning = $meaning }
+        }
+        [void]$explain.Add('')
+    }
+    $hexKnown = @($hexCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+            $msg = Get-HexErrorMeaning -Hex $_.Key
+            if ($msg) { [pscustomobject]@{ Code = $_.Key; Count = $_.Value; Meaning = $msg } }
+        } | Select-Object -First 15)
+    if ($hexKnown.Count -gt 0) {
+        [void]$explain.Add('WINDOWS ERROR CODES FOUND (Windows'' own description; codes Windows does not know are left out)')
+        foreach ($h in $hexKnown) { [void]$explain.Add(('  {0}  x{1:N0}  {2}' -f $h.Code, $h.Count, $h.Meaning)) }
+        [void]$explain.Add('')
+    }
+    if ($explain.Count -gt 0) { $o.InsertRange(3, $explain) }
     Save-Text '12_ODL_Signatures.txt' $o
 
     # Findings. FileSyncError and access words are the useful signals. Other words are shown for information.
@@ -2414,7 +2612,9 @@ function Step-OdlSignatures {
     $soft = @($kwCounts.GetEnumerator() | Where-Object { ($strong -contains $_.Key) -and -not ($hot -contains $_.Key) } | Sort-Object Value -Descending)
     if ($hotFound.Count -gt 0) {
         $txt = ($hotFound | Select-Object -First 6 | ForEach-Object { '{0} x{1:N0}' -f $_.Key, $_.Value }) -join ', '
-        Add-Finding 'Log signatures' 'Sync error words in OneDrive logs' 'WARN' $txt 'The OneDrive logs record sync errors. Open 12_ODL_Signatures.txt and read the top signatures. Send the package to L2.'
+        $named = @($script:OdlErrorsExplained | Where-Object { $_.Name -ne 'PostponedRetryComplete' } | Select-Object -First 2)
+        if ($named.Count -gt 0) { $txt += '. Main error: ' + (($named | ForEach-Object { '{0} x{1:N0} = {2}' -f $_.Name, $_.Count, $_.Meaning }) -join ' | ') }
+        Add-Finding 'Log signatures' 'Sync error words in OneDrive logs' 'WARN' $txt 'The OneDrive logs record sync errors. The meaning of each error is at the top of 12_ODL_Signatures.txt. Send the package to L2 if the action does not clear it.'
     }
     elseif ($soft.Count -gt 0) {
         $txt = ($soft | Select-Object -First 6 | ForEach-Object { '{0} x{1:N0}' -f $_.Key, $_.Value }) -join ', '
@@ -2498,6 +2698,148 @@ function Get-FixSteps {
     return @()
 }
 
+function New-TicketNote {
+    # A short note to paste into the ticket: who, what, result, the top findings, where the stuck items are, and the next action.
+    # Shown at the end of the run, written to 00_TicketNote.txt, and included in the summary and the HTML report.
+    param([object[]]$Sorted, [int]$NFail, [int]$NWarn, [int]$NInfo, [int]$NPass)
+    $n = New-Object System.Collections.ArrayList
+    $pkg = $script:OutDir
+    if ($script:DoZip) { $pkg = $script:OutDir.TrimEnd('\') + '.zip' }
+    [void]$n.Add(('OneDrive diagnostics (OneDriveDiag v{0}, {1} level) on {2}, user {3}, {4}.' -f $script:ScriptVersion, $script:LevelName, $env:COMPUTERNAME, $script:CurrentUser, $script:StartTime.ToString('yyyy-MM-dd HH:mm')))
+    $client = @()
+    if ($script:Facts.Contains('OneDrive version')) { $client += ('OneDrive ' + $script:Facts['OneDrive version']) }
+    if ($script:Facts.Contains('OneDrive running')) { $client += ('running: ' + $script:Facts['OneDrive running']) }
+    if ($script:Facts.Contains('Sync roots')) { $client += ('sync roots: ' + $script:Facts['Sync roots']) }
+    if ($client.Count -gt 0) { [void]$n.Add(($client -join '; ') + '.') }
+    [void]$n.Add(('Result: {0} FAIL, {1} WARN, {2} INFO, {3} PASS.' -f $NFail, $NWarn, $NInfo, $NPass))
+    $top = @($Sorted | Where-Object { $_.Status -eq 'FAIL' -or $_.Status -eq 'WARN' } | Select-Object -First 5)
+    if ($top.Count -gt 0) {
+        [void]$n.Add('Findings:')
+        foreach ($f in $top) {
+            $d = [string]$f.Detail
+            if ($d.Length -gt 230) { $d = $d.Substring(0, 227) + '...' }
+            [void]$n.Add(('- [{0}] {1}: {2}' -f $f.Status, $f.Check, $d))
+        }
+    }
+    else { [void]$n.Add('Findings: no FAIL or WARN. The PC side looks healthy.') }
+    foreach ($r in $script:ScanResults) {
+        if (($r.SyncNot + $r.PendingStale) -gt 0) {
+            $where = (@($r.Hotspots | Where-Object { $_.Level -eq 1 } | Select-Object -First 3) | ForEach-Object { '{0} ({1})' -f $_.Folder, $_.Total }) -join ', '
+            $apps = ''
+            if ($r.OpenApps -and $r.OpenApps.Count -gt 0) { $apps = '; open in ' + (($r.OpenApps.Keys | Sort-Object) -join ', ') }
+            [void]$n.Add(('Stuck items in {0}: {1} not in sync, {2} waiting to upload; in {3}{4}.' -f $r.Title, $r.SyncNot, $r.PendingStale, $where, $apps))
+        }
+    }
+    $first = @($Sorted | Where-Object { ($_.Status -eq 'FAIL' -or $_.Status -eq 'WARN') -and $_.Advice } | Select-Object -First 1)
+    if ($first.Count -gt 0) { [void]$n.Add('Next action: ' + $first[0].Advice) }
+    else { [void]$n.Add('Next action: no fault found on the PC. Confirm the exact symptom, path and time with the user, and compare with SharePoint Online.') }
+    [void]$n.Add('Package: ' + $pkg)
+    return @($n)
+}
+
+function ConvertTo-Html5 {
+    # HTML-encodes text for the report.
+    param([object]$Text)
+    return [System.Net.WebUtility]::HtmlEncode([string]$Text)
+}
+
+function Write-HtmlReport {
+    # Writes 00_Report.html: a self-contained, colour-coded, one-page view of the results for the helpdesk.
+    # No external files, fonts or scripts are loaded, so it opens offline and inside ticket systems.
+    param([object[]]$Sorted, [int]$NFail, [int]$NWarn, [int]$NInfo, [int]$NPass, [string[]]$Note)
+    $h = New-Object System.Text.StringBuilder
+    $css = @'
+:root{--bg:#212529;--panel:#2b3035;--panel2:#343a40;--line:#3d444b;--text:#f5f6f7;--muted:#adb5bd;--lime:#81d742;--green:#78ca38;--deep:#1f892c;--forest:#143800;--teal:#1b9cae;--fail:#e5534b;--warn:#e0a526}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 "Segoe UI",Arial,sans-serif}
+header{background:linear-gradient(90deg,var(--forest),var(--deep));padding:22px 32px;border-bottom:4px solid var(--lime)}
+header h1{margin:0;font-size:24px}
+header p{margin:4px 0 0;color:#dfeecf}
+main{max-width:1200px;margin:0 auto;padding:20px 32px 48px}
+h2{color:var(--lime);font-size:18px;margin:30px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.badges{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.badge{padding:8px 16px;border-radius:6px;font-weight:600;background:var(--panel2)}
+.FAIL{color:#fff;background:var(--fail)}.WARN{color:#1a1a1a;background:var(--warn)}.INFO{color:#fff;background:var(--teal)}.PASS{color:#10240a;background:var(--lime)}
+.tag{display:inline-block;min-width:46px;text-align:center;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:700}
+table{border-collapse:collapse;width:100%;background:var(--panel);font-size:14px}
+th{background:var(--panel2);color:var(--lime);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+td.num{text-align:right;white-space:nowrap}
+.advice{color:var(--muted);font-size:13px;margin-top:3px}
+.box{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--lime);border-radius:6px;padding:12px 16px}
+.box.fix{border-left-color:var(--fail)}
+pre{white-space:pre-wrap;margin:0;font:13px/1.5 Consolas,monospace;color:var(--text)}
+button{background:var(--lime);color:#10240a;border:0;border-radius:4px;padding:6px 14px;font-weight:700;cursor:pointer;margin-top:10px}
+a{color:var(--teal)}
+.facts td:first-child{color:var(--muted);width:30%}
+footer{color:var(--muted);font-size:12px;padding:20px 32px;border-top:1px solid var(--line)}
+'@
+    [void]$h.Append('<!DOCTYPE html><html lang="en-AU"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OneDriveDiag Report</title><style>' + $css + '</style></head><body>')
+    [void]$h.Append('<header><h1>OneDrive diagnostic report</h1><p>' + (ConvertTo-Html5 ('{0}  |  {1}  |  {2}  |  {3} level  |  OneDriveDiag v{4}' -f $env:COMPUTERNAME, $script:CurrentUser, $script:StartTime.ToString('yyyy-MM-dd HH:mm'), $script:LevelName, $script:ScriptVersion)) + '</p></header><main>')
+    [void]$h.Append('<div class="badges"><span class="badge FAIL">' + $NFail + ' FAIL</span><span class="badge WARN">' + $NWarn + ' WARN</span><span class="badge INFO">' + $NInfo + ' INFO</span><span class="badge PASS">' + $NPass + ' PASS</span></div>')
+
+    # Ticket note with a copy button.
+    [void]$h.Append('<h2>Helpdesk note (copy into the ticket)</h2><div class="box"><pre id="note">' + (ConvertTo-Html5 ($Note -join [Environment]::NewLine)) + '</pre><button onclick="navigator.clipboard.writeText(document.getElementById(''note'').innerText);this.innerText=''Copied''">Copy note</button></div>')
+
+    # Fix steps for FAIL findings.
+    foreach ($f in @($Sorted | Where-Object { $_.Status -eq 'FAIL' })) {
+        $steps = @(Get-FixSteps -Check $f.Check)
+        if ($steps.Count -gt 0) { [void]$h.Append('<h2>' + (ConvertTo-Html5 $steps[0]) + '</h2><div class="box fix"><pre>' + (ConvertTo-Html5 (($steps | Select-Object -Skip 1) -join [Environment]::NewLine)) + '</pre></div>') }
+    }
+
+    # Findings.
+    [void]$h.Append('<h2>Findings</h2><table><tr><th style="width:70px">Result</th><th style="width:16%">Area</th><th>Check, what was found and what to do</th></tr>')
+    foreach ($f in $Sorted) {
+        $adv = ''
+        if ($f.Advice) { $adv = '<div class="advice">' + (ConvertTo-Html5 $f.Advice) + '</div>' }
+        [void]$h.Append('<tr><td><span class="tag ' + $f.Status + '">' + $f.Status + '</span></td><td>' + (ConvertTo-Html5 $f.Area) + '</td><td><b>' + (ConvertTo-Html5 $f.Check) + '</b><br>' + (ConvertTo-Html5 $f.Detail) + $adv + '</td></tr>')
+    }
+    [void]$h.Append('</table>')
+
+    # Where the stuck items are, and what has them open.
+    foreach ($r in $script:ScanResults) {
+        if (@($r.Hotspots).Count -gt 0) {
+            [void]$h.Append('<h2>' + (ConvertTo-Html5 ('Where the stuck items are: ' + $r.Title)) + '</h2><p class="advice">' + (ConvertTo-Html5 ('Relative to ' + $r.StartPath + '. These folders show the red cross.')) + '</p><table><tr><th>Folder</th><th style="width:110px">Not in sync</th><th style="width:110px">Waiting</th></tr>')
+            foreach ($x in (@($r.Hotspots) | Select-Object -First 40)) {
+                $pad = ''
+                if ($x.Level -eq 2) { $pad = 'padding-left:28px;color:#adb5bd' }
+                [void]$h.Append('<tr><td style="' + $pad + '">' + (ConvertTo-Html5 $x.Folder) + '</td><td class="num">' + $x.NotInSync + '</td><td class="num">' + $x.WaitingToUpload + '</td></tr>')
+            }
+            [void]$h.Append('</table>')
+        }
+        if (@($r.OpenFiles).Count -gt 0) {
+            [void]$h.Append('<h2>' + (ConvertTo-Html5 ('Stuck files and what has them open: ' + $r.Title)) + '</h2><table><tr><th style="width:140px">State</th><th style="width:220px">Open in</th><th>File</th></tr>')
+            foreach ($o in (@($r.OpenFiles) | Select-Object -First 50)) { [void]$h.Append('<tr><td>' + (ConvertTo-Html5 $o.State) + '</td><td>' + (ConvertTo-Html5 $o.OpenBy) + '</td><td>' + (ConvertTo-Html5 $o.Path) + '</td></tr>') }
+            [void]$h.Append('</table>')
+        }
+    }
+
+    # OneDrive log errors in plain language.
+    if (@($script:OdlErrorsExplained).Count -gt 0) {
+        [void]$h.Append('<h2>OneDrive log errors explained</h2><table><tr><th style="width:34%">Error</th><th style="width:70px">Count</th><th>Meaning and action</th></tr>')
+        foreach ($x in $script:OdlErrorsExplained) { [void]$h.Append('<tr><td>' + (ConvertTo-Html5 $x.Name) + '</td><td class="num">' + $x.Count + '</td><td>' + (ConvertTo-Html5 $x.Meaning) + '</td></tr>') }
+        [void]$h.Append('</table>')
+    }
+
+    # Key facts.
+    [void]$h.Append('<h2>Key facts</h2><table class="facts">')
+    foreach ($k in $script:Facts.Keys) { [void]$h.Append('<tr><td>' + (ConvertTo-Html5 $k) + '</td><td>' + (ConvertTo-Html5 $script:Facts[$k]) + '</td></tr>') }
+    [void]$h.Append('</table>')
+
+    # Evidence files (relative links, so they work inside the folder or after unzipping).
+    [void]$h.Append('<h2>Evidence files</h2><table><tr><th>File</th><th style="width:110px">Size</th></tr>')
+    $root = $script:OutDir.TrimEnd('\') + '\'
+    $listed = @(Get-ChildItem -LiteralPath $script:OutDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Rel = $_.FullName.Substring($root.Length); Size = (Format-Bytes $_.Length) } })
+    foreach ($extra in @('00_Summary.txt', '00_Manifest.json', '00_TicketNote.txt')) { if (-not ($listed | Where-Object { $_.Rel -eq $extra })) { $listed += [pscustomobject]@{ Rel = $extra; Size = '' } } }
+    foreach ($x in ($listed | Sort-Object Rel)) {
+        $href = ($x.Rel -replace '\\', '/')
+        [void]$h.Append('<tr><td><a href="' + (ConvertTo-Html5 $href) + '">' + (ConvertTo-Html5 $x.Rel) + '</a></td><td class="num">' + $x.Size + '</td></tr>')
+    }
+    [void]$h.Append('</table></main><footer>Confidential: contains user, tenant, site, file and folder names. OneDriveDiag v' + $script:ScriptVersion + '. Read-only collection.</footer></body></html>')
+    try { [System.IO.File]::WriteAllText((Join-Path $script:OutDir '00_Report.html'), $h.ToString(), (New-Object System.Text.UTF8Encoding($false))) }
+    catch { Write-Log ('HTML report failed: ' + $_.Exception.Message) 'WARN' }
+}
+
 function Step-Report {
     # STEP: Write the plain-language summary, the findings CSV and the manifest.
     $finish = Get-Date
@@ -2512,6 +2854,10 @@ function Step-Report {
 
     Save-Csv '00_Findings.csv' ($sorted | Select-Object -Property @('Status', 'Area', 'Check', 'Detail', 'Advice'))
 
+    # Helpdesk ticket note: saved, shown at the end of the run, and placed near the top of the summary and report.
+    $script:TicketNote = @(New-TicketNote -Sorted $sorted -NFail $nFail -NWarn $nWarn -NInfo $nInfo -NPass $nPass)
+    Save-Text '00_TicketNote.txt' $script:TicketNote
+
     $s = New-Object System.Collections.ArrayList
     [void]$s.Add('ONEDRIVE DIAGNOSTIC SUMMARY')
     [void]$s.Add('===========================')
@@ -2523,6 +2869,9 @@ function Step-Report {
     [void]$s.Add('Script version  : ' + $script:ScriptVersion)
     [void]$s.Add('')
     [void]$s.Add(('RESULT: {0} FAIL, {1} WARN, {2} INFO, {3} PASS' -f $nFail, $nWarn, $nInfo, $nPass))
+    [void]$s.Add('')
+    [void]$s.Add('HELPDESK NOTE (copy into the ticket; also in 00_TicketNote.txt)')
+    foreach ($line in $script:TicketNote) { [void]$s.Add('  ' + $line) }
     [void]$s.Add('')
     [void]$s.Add('KEY FACTS')
     foreach ($k in $script:Facts.Keys) { [void]$s.Add(('  {0,-34} {1}' -f $k, $script:Facts[$k])) }
@@ -2585,6 +2934,8 @@ function Step-Report {
     [void]$s.Add('STEP TIMINGS')
     foreach ($r in $script:StepResults) { [void]$s.Add(('  {0,-48} {1,-8} {2,7:N1} s' -f $r.Name, $r.Status, $r.Seconds)) }
     [void]$s.Add('')
+    # The HTML report is written before the file list so it appears in it.
+    Write-HtmlReport -Sorted $sorted -NFail $nFail -NWarn $nWarn -NInfo $nInfo -NPass $nPass -Note $script:TicketNote
     [void]$s.Add('FILES IN THIS PACKAGE')
     $root = $script:OutDir.TrimEnd('\') + '\'
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutDir -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName)) {
@@ -2686,7 +3037,7 @@ function Invoke-Step {
 function Show-Plan {
     # Shows what will happen, then waits for Enter in interactive mode.
     Write-Host ''
-    Write-Host 'PLAN' -ForegroundColor Cyan
+    Write-Host 'PLAN' -ForegroundColor Green
     Write-Host ('  Computer / user   : {0} / {1}' -f $env:COMPUTERNAME, $script:CurrentUser)
     Write-Host ('  Collection level  : {0}' -f $script:LevelName)
     Write-Host ('  Output folder     : {0}' -f $script:OutDir)
@@ -2756,9 +3107,9 @@ Write-Progress -Id 1 -Activity 'OneDrive diagnostics' -Completed
 
 # ---- FINISH ----
 Write-Host ''
-Write-Host '==============================================================================' -ForegroundColor Cyan
+Write-Host '==============================================================================' -ForegroundColor DarkGreen
 Write-Host '  Collection complete' -ForegroundColor Green
-Write-Host '==============================================================================' -ForegroundColor Cyan
+Write-Host '==============================================================================' -ForegroundColor DarkGreen
 $col = 'Green'
 if ($script:CountWarn -gt 0) { $col = 'Yellow' }
 if ($script:CountFail -gt 0) { $col = 'Red' }
@@ -2778,8 +3129,16 @@ foreach ($f in @($shown | Where-Object { $_.Status -eq 'FAIL' })) {
     }
 }
 if (@($shown | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { Write-Host '' }
-Write-Host '  Next   : open 00_Summary.txt first. Attach the zip (or folder) to the ticket.'
+Write-Host '  Next   : open 00_Report.html (or 00_Summary.txt). Attach the zip (or folder) to the ticket.'
 Write-Host '  Note   : the package contains file and folder names. Handle it as confidential.' -ForegroundColor DarkGray
+
+# The ticket note, last on screen so it is easy to select and copy from an RMM terminal. No indent, so it pastes cleanly.
+if (@($script:TicketNote).Count -gt 0) {
+    Write-Host ''
+    Write-Host '---- HELPDESK NOTE (copy into the ticket; also saved as 00_TicketNote.txt) ----' -ForegroundColor Green
+    foreach ($line in $script:TicketNote) { Write-Host $line }
+    Write-Host '---- END OF NOTE ----' -ForegroundColor Green
+}
 if ($OpenOutput.IsPresent) {
     $openTarget = $script:OutputParent
     if (Test-Path -LiteralPath $script:OutDir) { $openTarget = $script:OutDir }

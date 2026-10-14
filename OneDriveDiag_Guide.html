@@ -5,34 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OneDriveDiag Guide</title>
 <style>
-:root{--navy:#00233f;--red:#a63529;--green:#2d5b4c;--sand:#cfaa8d;--ink:#1c2630;--paper:#fbf8f5;}
+:root{--bg:#212529;--panel:#2b3035;--panel2:#343a40;--line:#3d444b;--text:#f5f6f7;--muted:#adb5bd;--lime:#81d742;--green:#78ca38;--deep:#1f892c;--forest:#143800;--teal:#1b9cae;--fail:#e5534b;--warn:#e0a526}
 *{box-sizing:border-box}
-body{margin:0;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--paper);line-height:1.55}
-header{background:var(--navy);color:#fff;padding:28px 40px;border-bottom:6px solid var(--sand)}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;color:var(--text);background:var(--bg);line-height:1.55}
+header{background:linear-gradient(90deg,var(--forest),var(--deep));color:#fff;padding:28px 40px;border-bottom:4px solid var(--lime)}
 header h1{margin:0 0 6px;font-size:28px}
-header p{margin:0;color:#e8dccf}
+header p{margin:0;color:#dfeecf}
 .wrap{display:flex;max-width:1280px;margin:0 auto}
-nav{width:250px;flex:none;padding:24px 16px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow:auto;border-right:1px solid #e3d9ce}
-nav a{display:block;padding:5px 8px;color:var(--navy);text-decoration:none;font-size:14px;border-radius:4px}
-nav a:hover{background:#efe5da}
+nav{width:250px;flex:none;padding:24px 16px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow:auto;border-right:1px solid var(--line)}
+nav a{display:block;padding:5px 8px;color:var(--text);text-decoration:none;font-size:14px;border-radius:4px}
+nav a:hover{background:var(--panel2);color:var(--lime)}
 main{flex:1;padding:24px 40px 60px;min-width:0}
-h2{color:var(--navy);border-bottom:3px solid var(--sand);padding-bottom:6px;margin-top:42px}
+h2{color:var(--lime);border-bottom:1px solid var(--line);padding-bottom:6px;margin-top:42px}
 h3{color:var(--green);margin-top:26px}
-table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;background:#fff}
-th{background:var(--navy);color:#fff;text-align:left;padding:8px 10px}
-td{border:1px solid #e3d9ce;padding:8px 10px;vertical-align:top}
-tr:nth-child(even) td{background:#fcf9f6}
-code{background:#efe5da;padding:1px 5px;border-radius:3px;font-family:Consolas,monospace;font-size:13px}
-pre{background:#0f2233;color:#f2e9df;padding:14px 16px;border-radius:6px;overflow:auto;font-size:13px}
+a{color:var(--teal)}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;background:var(--panel)}
+th{background:var(--panel2);color:var(--lime);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{border:1px solid var(--line);padding:8px 10px;vertical-align:top}
+tr:nth-child(even) td{background:#2f353a}
+code{background:var(--panel2);color:#d7f5b8;padding:1px 5px;border-radius:3px;font-family:Consolas,monospace;font-size:13px}
+pre{background:#161a1d;color:var(--text);border:1px solid var(--line);padding:14px 16px;border-radius:6px;overflow:auto;font-size:13px}
 pre code{background:none;padding:0;color:inherit}
-.note{border-left:5px solid var(--sand);background:#fff;padding:10px 16px;margin:16px 0}
-.warn{border-left:5px solid var(--red);background:#fff;padding:10px 16px;margin:16px 0}
-.ok{border-left:5px solid var(--green);background:#fff;padding:10px 16px;margin:16px 0}
-.tag{display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;font-size:12px;font-weight:600}
-.FAIL{background:var(--red)}.WARN{background:#b87a1d}.INFO{background:#46647a}.PASS{background:var(--green)}
+.note{border-left:5px solid var(--teal);background:var(--panel);padding:10px 16px;margin:16px 0}
+.warn{border-left:5px solid var(--fail);background:var(--panel);padding:10px 16px;margin:16px 0}
+.ok{border-left:5px solid var(--lime);background:var(--panel);padding:10px 16px;margin:16px 0}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:700}
+.FAIL{background:var(--fail);color:#fff}.WARN{background:var(--warn);color:#1a1a1a}.INFO{background:var(--teal);color:#fff}.PASS{background:var(--lime);color:#10240a}
 ol li,ul li{margin:4px 0}
-footer{padding:20px 40px;color:#6b5f55;font-size:13px;border-top:1px solid #e3d9ce}
+footer{padding:20px 40px;color:var(--muted);font-size:13px;border-top:1px solid var(--line)}
 @media(max-width:900px){nav{display:none}main{padding:20px}}
+@media print{body{background:#fff;color:#000}header{background:#1f892c}table,td,th,pre,.note,.warn,.ok{background:#fff;color:#000}th{color:#1f892c}}
 </style>
 </head>
 <body>
@@ -82,7 +84,7 @@ This creates <code>C:\Temp</code> if it is missing, turns on TLS 1.2 (older Wind
 <pre><code>powershell.exe -ExecutionPolicy Bypass -File C:\temp\OneDriveDiag.ps1</code></pre></li>
 <li>Answer the questions on screen. Press Enter to accept the default (shown as "default"). Standard is the usual choice.</li>
 <li>Read the plan, then press Enter to start. Keep the window open. A progress bar shows each step.</li>
-<li>When you see <b>Collection complete</b>, open <code>00_Summary.txt</code>. Attach the zip (or the folder) to the ticket.</li>
+<li>When you see <b>Collection complete</b>, copy the <b>HELPDESK NOTE</b> block printed at the end of the screen into the ticket (it is also saved as <code>00_TicketNote.txt</code>). Open <code>00_Report.html</code> for the full colour-coded result. Attach the zip (or the folder) to the ticket.</li>
 <li>Write down the exact path of a file or folder that shows the problem, the time it happened, and take a screenshot with the Status column visible in File Explorer. Add these to the ticket.</li>
 </ol>
 <div class="warn"><b>Do not reset, unlink or reinstall OneDrive</b> on a large library until L2 has reviewed the package. A rebuild of a library with hundreds of thousands of items can cost the user a full day.</div>
@@ -111,12 +113,16 @@ This creates <code>C:\Temp</code> if it is missing, turns on TLS 1.2 (older Wind
 <tr><td><b>File index (one pass)</b></td><td>One walk of each chosen sync root. Each OneDrive item's "in sync" mark, read from the Windows Cloud Files API (the mark File Explorer uses to draw the green tick or the red cross). Counts by state (online-only, downloaded, always keep, local-only), attribute histogram, top-level folder table, extensions, largest files, longest paths, plus an exceptions list: long local paths, server paths near 400 characters, files OneDrive does not manage, bad names, conflict copies, lock files, links, unreadable folders.</td><td>Finds the specific items behind a vague report such as red crosses, without opening any file. The same pass feeds every check, so the tree is walked once.</td><td><code>11_FileSystem_*_Summary.txt, _Exceptions.csv, _TopLevel.csv, _FullIndex.csv (optional)</code></td></tr>
 <tr><td><b>Log signatures</b></td><td>Error words found in the newest OneDrive binary logs (ODL) from every log folder (each account plus Common), including compressed .odlgz logs, cleaned of ids and counted.</td><td>The logs hold the actual sync error codes (for example FileSyncError and UpdatePHState entries) that the summary counters may not show.</td><td><code>12_ODL_Signatures.txt</code></td></tr>
 <tr><td><b>Raw logs (Deep)</b></td><td>Copies of the small ini files and the newest ODL files.</td><td>Lets L2 or Microsoft Support read the original logs.</td><td><code>13_RawLogs\</code></td></tr>
-<tr><td><b>Report</b></td><td>Findings scored PASS, INFO, WARN or FAIL, with plain advice. Manifest with parameters, timings and counts.</td><td>One page that tells the helpdesk what to do next.</td><td><code>00_Summary.txt, 00_Findings.csv, 00_Manifest.json, 00_RunLog.txt</code></td></tr>
+<tr><td><b>Stuck items</b></td><td>For items not in sync and files waiting to upload: counts per folder one and two levels down (where the red crosses are), and for up to 50 stuck files the program that has them open (Windows Restart Manager, no admin needed).</td><td>Turns "red crosses on the library" into "these four subfolders, this workbook, open in Excel".</td><td><code>11_FileSystem_*_Hotspots.csv, _OpenFiles.csv</code></td></tr>
+<tr><td><b>Errors explained</b></td><td>OneDrive log error names (after <code>ErrorCode::</code>) with plain-language meaning and action, and Windows error codes with Windows' own description.</td><td>The helpdesk can act on an error name without searching for it.</td><td>Top of <code>12_ODL_Signatures.txt</code>, and the report</td></tr>
+<tr><td><b>Report</b></td><td>Findings scored PASS, INFO, WARN or FAIL, with plain advice. A colour-coded HTML report, a ready-to-paste ticket note, and a manifest with parameters, timings and counts.</td><td>One page that tells the helpdesk what to do next, and a note that documents the ticket in seconds.</td><td><code>00_Report.html, 00_TicketNote.txt, 00_Summary.txt, 00_Findings.csv, 00_Manifest.json, 00_RunLog.txt</code></td></tr>
 </table>
 
 <h2 id="outputs">5. Output files</h2>
 <p>Everything is written to <code>C:\temp\onedrivediag_&lt;hostname&gt;_&lt;username&gt;_&lt;yyyyMMdd_HHmmss&gt;\</code>. If a zip is requested it is written next to the folder with the same name and a .zip extension.</p>
-<pre><code>00_Summary.txt                    Start here. Plain-language result and next steps
+<pre><code>00_Report.html                    Start here. Colour-coded result, fix steps, where the stuck items are, ticket note
+00_TicketNote.txt                 Ready-to-paste helpdesk note (also printed at the end of the run)
+00_Summary.txt                    Plain-language result and next steps (text version of the report)
 00_Findings.csv                   Every check with status, detail and advice
 00_Manifest.json                  Parameters, timings, counts, key facts
 00_RunLog.txt                     Time-stamped run log, including every question and the answer used ([CHOICE] lines)
@@ -136,6 +142,8 @@ This creates <code>C:\Temp</code> if it is missing, turns on TLS 1.2 (older Wind
 13_RawLogs\                       Raw copies (Deep or -IncludeRawLogs)</code></pre>
 
 <h2 id="summary">6. Reading the summary</h2>
+<p><b>The helpdesk note.</b> At the end of every run the tool prints a short note between <code>---- HELPDESK NOTE</code> and <code>---- END OF NOTE</code>. It names the PC, user, time and tool version, the OneDrive version, the result counts, the top five FAIL and WARN findings, where any stuck items are and which programs have them open, the next action, and where the package is. Select it in the terminal and paste it into the ticket. The same text is in <code>00_TicketNote.txt</code>, near the top of <code>00_Summary.txt</code>, and in <code>00_Report.html</code> with a Copy note button.</p>
+<p><b>The HTML report.</b> <code>00_Report.html</code> is a single file that opens in any browser without internet access. It shows the result counts, the ticket note, step-by-step fixes for FAIL findings, every finding with its advice, the "where the stuck items are" and "open in" tables, OneDrive log errors explained, key facts, and links to every evidence file in the package.</p>
 <p>Each check ends with one of four results.</p>
 <table>
 <tr><th>Result</th><th>Meaning</th></tr>

@@ -41,8 +41,9 @@ The `?t=` value stops a cached older copy being served. Use the `raw.githubuserc
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Temp\OneDriveDiag.ps1
 ```
 
-Answer the numbered questions (Enter accepts the default; Standard is recommended), then open `00_Summary.txt`
-in the result folder and attach the zip to the ticket.
+Answer the numbered questions (Enter accepts the default; Standard is recommended). When it finishes, copy the
+**HELPDESK NOTE** block printed at the end into the ticket, open `00_Report.html` for the full result, and attach the
+zip to the ticket.
 
 **Hands-free (RMM shell without prompts):**
 
@@ -64,8 +65,8 @@ Results go to `C:\Temp\onedrivediag_<hostname>_<username>_<yyyyMMdd_HHmmss>\` (p
 | Cloud Files platform | CldFlt driver, filter drivers (elevated), overlay handlers |
 | Event logs | OneDrive crashes, Cloud Files errors, power and boot timeline, disk and NTFS errors, sign-in events |
 | Network | DNS and TCP 443 to Microsoft 365 and tenant hosts, proxy, time sync |
-| File index | One streamed pass per library: file states, long paths (local and the 400 character SharePoint limit), bad names, conflict copies, files OneDrive is not managing, junctions |
-| Log signatures | Error words from OneDrive's binary ODL logs (all log folders, compressed logs included), de-duplicated and counted |
+| File index | One streamed pass per library: each item's "in sync" mark (what draws the red cross), files waiting to upload, where the stuck items are and which program has them open, file states, long paths (local and the 400 character SharePoint limit), bad names, conflict copies, files OneDrive is not managing, junctions |
+| Log signatures | Error words from OneDrive's binary ODL logs (all log folders, compressed logs included), de-duplicated and counted, with OneDrive error names and Windows error codes explained in plain language |
 | Raw logs (Deep) | Settings files and the newest ODL logs |
 
 Large libraries are never walked blindly. The tool reads the item count OneDrive reports and, above a threshold
@@ -96,7 +97,9 @@ Get-Help .\OneDriveDiag.ps1 -Full
 
 | File | Contents |
 |---|---|
-| `00_Summary.txt` | Start here. Results, key facts, what to do next |
+| `00_Report.html` | Start here. Colour-coded results, fix steps, where the stuck items are and what has them open, ticket note with a copy button |
+| `00_TicketNote.txt` | Ready-to-paste helpdesk note (also printed at the end of the run) |
+| `00_Summary.txt` | Text version: results, key facts, what to do next |
 | `00_Findings.csv` | Every check with status, detail and advice |
 | `00_RunLog.txt` | Time-stamped log, including every question and the answer used |
 | `00_Manifest.json` | Parameters, timings, counts |
