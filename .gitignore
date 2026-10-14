@@ -1,0 +1,10 @@
+# Diagnostic output (may contain user/tenant data)
+Output/
+*.zip
+*.log
+
+# Editor / OS
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
