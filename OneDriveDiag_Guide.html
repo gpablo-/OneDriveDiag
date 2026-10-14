@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneDriveDiag Guide</title>
+<style>
+:root{--navy:#00233f;--red:#a63529;--green:#2d5b4c;--sand:#cfaa8d;--ink:#1c2630;--paper:#fbf8f5;}
+*{box-sizing:border-box}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--paper);line-height:1.55}
+header{background:var(--navy);color:#fff;padding:28px 40px;border-bottom:6px solid var(--sand)}
+header h1{margin:0 0 6px;font-size:28px}
+header p{margin:0;color:#e8dccf}
+.wrap{display:flex;max-width:1280px;margin:0 auto}
+nav{width:250px;flex:none;padding:24px 16px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow:auto;border-right:1px solid #e3d9ce}
+nav a{display:block;padding:5px 8px;color:var(--navy);text-decoration:none;font-size:14px;border-radius:4px}
+nav a:hover{background:#efe5da}
+main{flex:1;padding:24px 40px 60px;min-width:0}
+h2{color:var(--navy);border-bottom:3px solid var(--sand);padding-bottom:6px;margin-top:42px}
+h3{color:var(--green);margin-top:26px}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;background:#fff}
+th{background:var(--navy);color:#fff;text-align:left;padding:8px 10px}
+td{border:1px solid #e3d9ce;padding:8px 10px;vertical-align:top}
+tr:nth-child(even) td{background:#fcf9f6}
+code{background:#efe5da;padding:1px 5px;border-radius:3px;font-family:Consolas,monospace;font-size:13px}
+pre{background:#0f2233;color:#f2e9df;padding:14px 16px;border-radius:6px;overflow:auto;font-size:13px}
+pre code{background:none;padding:0;color:inherit}
+.note{border-left:5px solid var(--sand);background:#fff;padding:10px 16px;margin:16px 0}
+.warn{border-left:5px solid var(--red);background:#fff;padding:10px 16px;margin:16px 0}
+.ok{border-left:5px solid var(--green);background:#fff;padding:10px 16px;margin:16px 0}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;font-size:12px;font-weight:600}
+.FAIL{background:var(--red)}.WARN{background:#b87a1d}.INFO{background:#46647a}.PASS{background:var(--green)}
+ol li,ul li{margin:4px 0}
+footer{padding:20px 40px;color:#6b5f55;font-size:13px;border-top:1px solid #e3d9ce}
+@media(max-width:900px){nav{display:none}main{padding:20px}}
+</style>
+</head>
+<body>
+<header>
+<h1>OneDriveDiag - OneDrive Diagnostic Collector</h1>
+<p>Companion guide for OneDriveDiag.ps1, version 1.0.0. Client agnostic. Read-only. Runs in the user context.</p>
+</header>
+<div class="wrap">
+<nav>
+<a href="#purpose">1. Purpose</a>
+<a href="#quickstart">2. Quick start for the helpdesk</a>
+<a href="#levels">3. Collection levels</a>
+<a href="#datamap">4. Data map</a>
+<a href="#outputs">5. Output files</a>
+<a href="#summary">6. Reading the summary</a>
+<a href="#findings">7. Findings reference</a>
+<a href="#large">8. Large libraries</a>
+<a href="#params">9. Parameters</a>
+<a href="#examples">10. Examples</a>
+<a href="#rmm">11. RMM shell use</a>
+<a href="#safety">12. Safety and privacy</a>
+<a href="#trouble">13. Troubleshooting</a>
+<a href="#design">14. Design notes</a>
+<a href="#limits">15. Limitations</a>
+<a href="#history">16. Version history</a>
+</nav>
+<main>
+
+<h2 id="purpose">1. Purpose</h2>
+<p>This tool collects a complete, read-only baseline of OneDrive health on one Windows PC. It is built for cases where a user reports sync problems (red crosses, files that do not sync, stuck folders) and the cause is not obvious. It gives the helpdesk a plain-language summary, and gives L2 the raw evidence in one package.</p>
+<p>The tool does not change, reset, repair or unlink OneDrive. Its only writes are inside its own output folder.</p>
+<div class="note"><b>Why a single tool.</b> In past cases, early checks looked at the wrong folder (a library mounted outside the OneDrive folder), found a healthy sync engine, and still left the user with visible faults. This tool finds the real sync roots first, reads the engine counters and the binary logs, and indexes the affected tree once, so the next person starts with evidence instead of guesses.</div>
+
+<h2 id="quickstart">2. Quick start for the helpdesk</h2>
+<ol>
+<li>Sign in as the user who has the problem, or open a shell in that user's context. Do not use SYSTEM.</li>
+<li>Copy <code>OneDriveDiag.ps1</code> to the PC, for example to <code>C:\temp</code>.</li>
+<li>Open Windows PowerShell. Run:
+<pre><code>powershell.exe -ExecutionPolicy Bypass -File C:\temp\OneDriveDiag.ps1</code></pre></li>
+<li>Answer the questions on screen. Press Enter to accept the default (shown as "default"). Standard is the usual choice.</li>
+<li>Read the plan, then press Enter to start. Keep the window open. A progress bar shows each step.</li>
+<li>When you see <b>Collection complete</b>, open <code>00_Summary.txt</code>. Attach the zip (or the folder) to the ticket.</li>
+<li>Write down the exact path of a file or folder that shows the problem, the time it happened, and take a screenshot with the Status column visible in File Explorer. Add these to the ticket.</li>
+</ol>
+<div class="warn"><b>Do not reset, unlink or reinstall OneDrive</b> on a large library until L2 has reviewed the package. A rebuild of a library with hundreds of thousands of items can cost the user a full day.</div>
+
+<h2 id="levels">3. Collection levels</h2>
+<table>
+<tr><th>Level</th><th>What it does</th><th>Typical time</th></tr>
+<tr><td><b>Quick</b></td><td>Environment, client, accounts and sync roots, counters, registry, Cloud Files, events, network, listings, and a top-level folder list of each sync root.</td><td>1 to 3 minutes</td></tr>
+<tr><td><b>Standard</b> (recommended)</td><td>Quick, plus the full file index (with the large library guard) and the OneDrive log signature scan.</td><td>3 to 20 minutes, depending on library size</td></tr>
+<tr><td><b>Deep</b></td><td>Standard, plus copies of the ini files and newest ODL logs. Optional full index CSV.</td><td>Standard time plus copy time</td></tr>
+</table>
+
+<h2 id="datamap">4. Data map</h2>
+<p>This is the full list of what is collected, why it matters, and where it is written.</p>
+<table>
+<tr><th style="width:14%">Area</th><th style="width:36%">What is collected</th><th style="width:30%">Why it matters</th><th>Output</th></tr>
+<tr><td><b>Environment</b></td><td>Windows build, uptime, Fast Startup, long path setting, memory, battery, power plan, fixed disk space, antivirus, Defender Controlled Folder Access state and its block or audit events that mention OneDrive, other sync clients, device join and sign-in token state (dsregcmd).</td><td>Low disk space stops downloads. A missing Primary Refresh Token causes sign-in prompts and sync authentication faults. Controlled Folder Access can silently block saves into Desktop and Documents after they move into OneDrive. Battery and uptime show whether the PC lost power.</td><td><code>01_Environment.txt, 01_Environment_dsregcmd.txt</code></td></tr>
+<tr><td><b>OneDrive client</b></td><td>Every OneDrive.exe copy (per-user and per-machine), version, running process (start time, CPU, memory, handles), startup entry, update scheduled tasks.</td><td>Confirms the client is installed, current and running in the right session.</td><td><code>02_OneDrive_Client.txt</code></td></tr>
+<tr><td><b>Accounts and sync roots</b></td><td>Each signed-in account, and every synced library and folder shortcut with its REAL local folder, library URL, scope id, drive type, free space and server path length. Known Folder Move state. Flags from global.ini and the account ini (clean shutdown, filter errors, mass delete, bandwidth limits, pending permission changes).</td><td>SharePoint libraries are often mounted outside the OneDrive folder. The path cannot be guessed. Checking the wrong folder wastes hours.</td><td><code>03_Accounts_and_SyncRoots.txt, 03_SyncRoots.csv</code></td></tr>
+<tr><td><b>Sync engine counters</b></td><td>SyncDiagnostics.log parsed. Error counters, stall flags, database reset flag, queue sizes, snapshot age, file and folder totals.</td><td>This is OneDrive's own view of its health. It reports zero errors on a healthy client, which helps rule the client in or out.</td><td><code>04_SyncDiagnostics_Parsed.txt, 04_SyncDiagnostics_raw_*.log</code></td></tr>
+<tr><td><b>Registry and policy</b></td><td>Exports of the OneDrive, SyncEngines, policy, User Shell Folders, Storage Sense, CldFlt and overlay keys. Policy values in plain language, the update ring, and the tenant allow and block lists checked against each signed-in work account.</td><td>Shows what IT has configured and where Windows thinks each sync root lives. A tenant that policy does not allow cannot sync at all.</td><td><code>05_Registry_and_Policy_Summary.txt, 05_Registry\*.reg</code></td></tr>
+<tr><td><b>Cloud Files platform</b></td><td>CldFlt driver start type and state, filter driver list (when elevated), shell icon overlay handlers and the 15 handler limit.</td><td>Files On-Demand needs the CldFlt driver. Wrong or missing sync icons are often an overlay slot problem.</td><td><code>06_CloudFiles_Platform.txt</code></td></tr>
+<tr><td><b>Event logs</b></td><td>OneDrive crashes and errors, Cloud Files filter log, power and boot timeline (event 41, 6008, 1074, 6005, 6006), disk and NTFS errors, Azure AD sign-in errors.</td><td>A power loss, disk fault or sign-in failure can start a sync fault. The timeline shows what came first.</td><td><code>07_Events_*.csv, 07_Events_Summary.txt</code></td></tr>
+<tr><td><b>Network and authentication</b></td><td>DNS and TCP 443 tests to Microsoft 365 hosts and the tenant SharePoint hosts found in the sync roots. WinHTTP and user proxy. Active adapters. Time sync.</td><td>Rules out connectivity, proxy and clock problems quickly.</td><td><code>08_Network_Endpoints.csv, 08_Network_and_Proxy.txt</code></td></tr>
+<tr><td><b>Settings and log listings</b></td><td>File names, sizes and dates in the OneDrive settings and logs folders. Sync database size.</td><td>Shows how large the sync database is and whether logs are still being written. File content is not read.</td><td><code>09_Settings_Folder_Listing.csv, 09_Logs_Folder_Listing.csv</code></td></tr>
+<tr><td><b>File index (one pass)</b></td><td>One walk of each chosen sync root. Counts by state (online-only, downloaded, always keep, local-only), attribute histogram, top-level folder table, extensions, largest files, longest paths, plus an exceptions list: long local paths, server paths near 400 characters, files OneDrive does not manage, bad names, conflict copies, lock files, links, unreadable folders.</td><td>Finds the specific items behind a vague report such as red crosses, without opening any file. The same pass feeds every check, so the tree is walked once.</td><td><code>11_FileSystem_*_Summary.txt, _Exceptions.csv, _TopLevel.csv, _FullIndex.csv (optional)</code></td></tr>
+<tr><td><b>Log signatures</b></td><td>Error words found in the newest OneDrive binary logs (ODL) from every log folder (each account plus Common), including compressed .odlgz logs, cleaned of ids and counted.</td><td>The logs hold the actual sync error codes (for example FileSyncError and UpdatePHState entries) that the summary counters may not show.</td><td><code>12_ODL_Signatures.txt</code></td></tr>
+<tr><td><b>Raw logs (Deep)</b></td><td>Copies of the small ini files and the newest ODL files.</td><td>Lets L2 or Microsoft Support read the original logs.</td><td><code>13_RawLogs\</code></td></tr>
+<tr><td><b>Report</b></td><td>Findings scored PASS, INFO, WARN or FAIL, with plain advice. Manifest with parameters, timings and counts.</td><td>One page that tells the helpdesk what to do next.</td><td><code>00_Summary.txt, 00_Findings.csv, 00_Manifest.json, 00_RunLog.txt</code></td></tr>
+</table>
+
+<h2 id="outputs">5. Output files</h2>
+<p>Everything is written to <code>C:\temp\onedrivediag_&lt;hostname&gt;_&lt;username&gt;_&lt;yyyyMMdd_HHmmss&gt;\</code>. If a zip is requested it is written next to the folder with the same name and a .zip extension.</p>
+<pre><code>00_Summary.txt                    Start here. Plain-language result and next steps
+00_Findings.csv                   Every check with status, detail and advice
+00_Manifest.json                  Parameters, timings, counts, key facts
+00_RunLog.txt                     Time-stamped run log
+01_Environment*.txt               Windows, hardware, disks, join state
+02_OneDrive_Client.txt            Client install and process
+03_Accounts_and_SyncRoots.txt     Accounts, sync roots, ini flags
+03_SyncRoots.csv                  Sync roots as a table
+04_SyncDiagnostics_*              Parsed and raw sync engine counters
+05_Registry\                      .reg exports
+05_Registry_and_Policy_Summary.txt
+06_CloudFiles_Platform.txt        CldFlt driver, filters, overlay handlers
+07_Events_*.csv                   Event log extracts
+08_Network_*                      Endpoint tests, proxy, time
+09_*_Listing.csv                  Settings and log folder listings
+11_FileSystem_*                   File index: summary, exceptions, top level, optional full index
+12_ODL_Signatures.txt             Error words from OneDrive binary logs
+13_RawLogs\                       Raw copies (Deep or -IncludeRawLogs)</code></pre>
+
+<h2 id="summary">6. Reading the summary</h2>
+<p>Each check ends with one of four results.</p>
+<table>
+<tr><th>Result</th><th>Meaning</th></tr>
+<tr><td><span class="tag FAIL">FAIL</span></td><td>A fault that normally stops sync. Fix it or escalate.</td></tr>
+<tr><td><span class="tag WARN">WARN</span></td><td>A likely contributor. Review it. Escalate if the user still has the problem.</td></tr>
+<tr><td><span class="tag INFO">INFO</span></td><td>Context for L2. Not a fault on its own.</td></tr>
+<tr><td><span class="tag PASS">PASS</span></td><td>The check is healthy.</td></tr>
+</table>
+<p>A result with no FAIL and no WARN does not prove the user has no problem. It means the PC side is healthy. Server-side conditions (for example a SharePoint site storage lock, permissions, or item metadata) cannot be seen from the PC. Compare the exact failing item with SharePoint Online.</p>
+
+<h2 id="findings">7. Findings reference</h2>
+<table>
+<tr><th>Area</th><th>Check</th><th>Result rule</th><th>Meaning</th><th>Helpdesk action</th></tr>
+<tr><td>Environment</td><td>System drive free space</td><td>FAIL under 2 GB. WARN under 10 GB or 10 percent.</td><td>OneDrive cannot download or hydrate files without space.</td><td>Free space first.</td></tr>
+<tr><td>Environment</td><td>Primary Refresh Token</td><td>WARN when AzureAdPrt is NO.</td><td>Sign-in token missing. Causes prompts and authentication faults.</td><td>Check device registration and user sign-in.</td></tr>
+<tr><td>Environment</td><td>Controlled Folder Access blocks</td><td>WARN when Defender block events (1123) mention OneDrive. INFO when the feature is on with no blocks.</td><td>Defender is stopping writes into protected folders.</td><td>Ask security to allow the blocked app. The blocked paths are in 01_Environment.txt.</td></tr>
+<tr><td>Environment</td><td>User context mismatch</td><td>WARN.</td><td>Session user differs from the desktop user, so HKCU data may belong to the wrong person.</td><td>Run again as the desktop user.</td></tr>
+<tr><td>Client</td><td>OneDrive installed / process</td><td>FAIL if no OneDrive.exe or not running.</td><td>No client, or the client is not running in the user session.</td><td>Start or repair OneDrive. Check crash events.</td></tr>
+<tr><td>Accounts</td><td>Account signed in</td><td>FAIL when no account.</td><td>User is not signed in.</td><td>Sign in, then run again.</td></tr>
+<tr><td>Sync roots</td><td>Folder exists</td><td>FAIL when the local folder is missing.</td><td>OneDrive expects a folder that is gone.</td><td>Escalate before any reset.</td></tr>
+<tr><td>Sync roots</td><td>Free space (other drives)</td><td>FAIL under 2 GB. WARN under 10 GB or 10 percent.</td><td>A library on a second drive has run out of room.</td><td>Free space on that drive.</td></tr>
+<tr><td>Accounts</td><td>Files On-Demand turned off by filter error</td><td>FAIL.</td><td>The Cloud Files driver failed to connect.</td><td>Restart. Escalate if it persists.</td></tr>
+<tr><td>Accounts</td><td>Clean shutdown</td><td>WARN when the last shutdown was not clean.</td><td>Matches a power loss or crash.</td><td>Compare with 07_Events_System_PowerBoot.csv.</td></tr>
+<tr><td>Sync counters</td><td>Stall flags</td><td>FAIL when a stall is reported.</td><td>Sync engine is stuck.</td><td>Escalate with the package.</td></tr>
+<tr><td>Sync counters</td><td>Error counters</td><td>WARN when any upload, download, hash, realizer or conflict counter is above zero.</td><td>OneDrive reports errors.</td><td>Read 12_ODL_Signatures.txt.</td></tr>
+<tr><td>Sync counters</td><td>Snapshot age</td><td>WARN when older than 24 hours.</td><td>Diagnostics are not being refreshed.</td><td>Check the client is running.</td></tr>
+<tr><td>Policy</td><td>Sync disabled by policy</td><td>FAIL when DisableFileSyncNGSC is 1.</td><td>A policy blocks sync.</td><td>Review the policy source.</td></tr>
+<tr><td>Policy</td><td>Tenant not allowed / blocked</td><td>FAIL when the account tenant is missing from AllowTenantList or is in BlockTenantList.</td><td>Policy stops this work account from syncing.</td><td>Check the OneDrive policy with IT.</td></tr>
+<tr><td>Cloud Files</td><td>CldFlt start type / state / filter loaded</td><td>FAIL when disabled, stopped or not loaded.</td><td>Files On-Demand cannot work.</td><td>Restart. Escalate.</td></tr>
+<tr><td>Cloud Files</td><td>Overlay handler count</td><td>WARN above 15.</td><td>Windows loads only 15 overlay handlers. Sync icons may be wrong.</td><td>Review the handler list.</td></tr>
+<tr><td>Events</td><td>OneDrive crashes</td><td>WARN.</td><td>Repeated crashes interrupt sync.</td><td>Note the faulting module.</td></tr>
+<tr><td>Events</td><td>Unexpected shutdowns</td><td>WARN.</td><td>Power loss can leave sync state unfinished.</td><td>Compare with the problem start time.</td></tr>
+<tr><td>Events</td><td>Disk and NTFS events</td><td>WARN.</td><td>File system errors can cause red crosses and failed syncs.</td><td>Consider a disk check.</td></tr>
+<tr><td>Events</td><td>Sign-in (AAD) events</td><td>INFO only, with the most common event ids.</td><td>This log is noisy on healthy PCs (hundreds of errors a week is normal). The Primary Refresh Token check is the reliable sign-in signal.</td><td>Review 07_Events_AAD_SignIn.csv only if the user gets repeated sign-in prompts.</td></tr>
+<tr><td>Network</td><td>DNS and TCP 443</td><td>FAIL for sign-in and SharePoint hosts. WARN for others.</td><td>Host cannot be reached.</td><td>Check DNS, VPN, firewall, proxy.</td></tr>
+<tr><td>File index</td><td>SharePoint path over 400</td><td>FAIL.</td><td>SharePoint cannot hold the path. Items will fail to sync.</td><td>Shorten names.</td></tr>
+<tr><td>File index</td><td>Path near limit / local path length</td><td>WARN.</td><td>Long paths fail in Explorer and in many apps.</td><td>Shorten names or use a shorter sync location.</td></tr>
+<tr><td>File index</td><td>Files not managed by OneDrive</td><td>WARN above 25. INFO otherwise.</td><td>Normal local files with no placeholder state.</td><td>Check whether they are new or untracked.</td></tr>
+<tr><td>File index</td><td>Name problems</td><td>WARN.</td><td>Leading or trailing space, trailing period, reserved names, SharePoint reserved names.</td><td>Rename the items.</td></tr>
+<tr><td>File index</td><td>Junctions or links</td><td>WARN.</td><td>Links inside a sync folder are not followed reliably.</td><td>Review the exceptions CSV.</td></tr>
+<tr><td>File index</td><td>Conflict copies, lock files, very large files</td><td>INFO.</td><td>Context for the user report.</td><td>Keep one version. Close the document.</td></tr>
+<tr><td>File index</td><td>Scan complete</td><td>WARN when the scan stopped at the time limit.</td><td>Results are partial.</td><td>Use -FocusPath or raise the limit.</td></tr>
+<tr><td>Log signatures</td><td>Sync error words</td><td>WARN for FileSyncError, access, quota, lock, name and path words. INFO for other words, including Throttl (it mostly matches code names on healthy PCs).</td><td>OneDrive logged errors.</td><td>Read the top signatures. Send to L2.</td></tr>
+<tr><td>Tool</td><td>Step stopped early</td><td>WARN when a collection step hit an unexpected error.</td><td>Part of the data for that step is missing. The rest of the package is still valid.</td><td>Send 00_RunLog.txt to whoever maintains the tool.</td></tr>
+</table>
+
+<h2 id="large">8. Large libraries</h2>
+<p>The file index never walks a large library without asking. The tool reads the item count that OneDrive already reports in SyncDiagnostics (files plus folders). When the count is above <code>-LargeDatasetThreshold</code> (default 100,000) and you have not narrowed the scan, you choose:</p>
+<ol>
+<li>Top-level folders only (fast).</li>
+<li>Index one folder that you name (best when the problem area is known).</li>
+<li>Index everything (stops at the time limit per sync root).</li>
+<li>Skip the file index.</li>
+</ol>
+<p>In <code>-Unattended</code> mode the default is top-level only. To scan one folder in a very large library:</p>
+<pre><code>.\OneDriveDiag.ps1 -Level Standard -Unattended -Zip -SyncRoot 'C:\Users\jsmith\Contoso\Projects - Documents' -FocusPath 'Project A'</code></pre>
+<p>How the single pass keeps cost down:</p>
+<ul>
+<li>One walk per root builds all counts, the exceptions list and the optional full index.</li>
+<li>Only file attributes, sizes and dates are read. No file is opened or downloaded.</li>
+<li>Results stream to disk, so memory stays small.</li>
+<li>Each problem category is capped at <code>-MaxExceptionsPerCategory</code> rows, but totals are always full counts.</li>
+<li>The full CSV of every item is optional because it is large (about 100 MB per 400,000 items).</li>
+<li>A time limit stops a long scan cleanly and marks the result partial.</li>
+<li>Paths longer than 260 characters are read by using the long path prefix.</li>
+</ul>
+<div class="note">Reading a folder in a OneDrive library can make OneDrive list that folder from the cloud the first time. This is normal and read-only, but it is the reason a full scan of a very large library is not the default.</div>
+
+<h2 id="params">9. Parameters</h2>
+<table>
+<tr><th>Parameter</th><th>Values</th><th>Default</th><th>Purpose</th></tr>
+<tr><td><code>-Level</code></td><td>Quick, Standard, Deep</td><td>Asked</td><td>Amount to collect. Standard is recommended.</td></tr>
+<tr><td><code>-OutputRoot</code></td><td>Folder path</td><td>C:\temp</td><td>Parent folder. The package folder is onedrivediag_&lt;hostname&gt;_&lt;username&gt;_&lt;yyyyMMdd_HHmmss&gt;.</td></tr>
+<tr><td><code>-SyncRoot</code></td><td>All, or one or more paths</td><td>Asked when more than one root exists</td><td>Which synced folders to index. Any folder path works, not only a sync root.</td></tr>
+<tr><td><code>-FocusPath</code></td><td>Full path, or path relative to the sync root</td><td>None</td><td>Limit the index to one folder, for example a single project folder.</td></tr>
+<tr><td><code>-LargeDatasetAction</code></td><td>Prompt, Full, TopLevel, Skip</td><td>Prompt</td><td>What to do when OneDrive reports more items than the threshold. In -Unattended mode, Prompt means TopLevel.</td></tr>
+<tr><td><code>-LargeDatasetThreshold</code></td><td>Number</td><td>100000</td><td>Files plus folders above which a library counts as large.</td></tr>
+<tr><td><code>-ScanTimeLimitMinutes</code></td><td>Number</td><td>15</td><td>Stops each index cleanly at this time and marks the result partial.</td></tr>
+<tr><td><code>-PathWarnLength</code></td><td>Number</td><td>260</td><td>Local path length flagged as too long.</td></tr>
+<tr><td><code>-ServerPathWarnLength</code></td><td>Number</td><td>360</td><td>Estimated SharePoint path length flagged as near the 400 character limit.</td></tr>
+<tr><td><code>-EventDays</code></td><td>Number</td><td>7</td><td>Days of event logs to read.</td></tr>
+<tr><td><code>-MaxEventsPerLog</code></td><td>Number</td><td>300</td><td>Maximum events exported per log.</td></tr>
+<tr><td><code>-MaxExceptionsPerCategory</code></td><td>Number</td><td>1000</td><td>Maximum rows per problem category. Totals are always full counts.</td></tr>
+<tr><td><code>-OdlMaxFiles</code></td><td>Number</td><td>6</td><td>Newest ODL files to scan per log folder (each account folder and Common).</td></tr>
+<tr><td><code>-OdlMaxTotalMB</code></td><td>Number</td><td>150</td><td>Total size limit for ODL files scanned or copied.</td></tr>
+<tr><td><code>-IncludeFullIndex</code></td><td>Switch</td><td>Off</td><td>Also write a CSV of every file and folder scanned. Large.</td></tr>
+<tr><td><code>-IncludeRawLogs</code></td><td>Switch</td><td>Off (on for Deep)</td><td>Copy ini files and newest ODL logs.</td></tr>
+<tr><td><code>-Zip</code></td><td>Switch</td><td>Asked</td><td>Create a zip and keep the folder.</td></tr>
+<tr><td><code>-ZipOnly</code></td><td>Switch</td><td>Off</td><td>Create a zip and remove the folder.</td></tr>
+<tr><td><code>-Unattended</code></td><td>Switch</td><td>Off</td><td>No prompts. Use from an RMM shell.</td></tr>
+<tr><td><code>-OpenOutput</code></td><td>Switch</td><td>Off</td><td>Open the result in File Explorer when finished.</td></tr>
+</table>
+<p>Any parameter you leave out is asked for on screen where a choice is needed, with a numbered list. With <code>-Unattended</code> the defaults are used and nothing is asked.</p>
+
+<h2 id="examples">10. Examples</h2>
+<h3>Guided run</h3>
+<pre><code>.\OneDriveDiag.ps1</code></pre>
+<h3>Standard collection with a zip</h3>
+<pre><code>.\OneDriveDiag.ps1 -Level Standard -Zip</code></pre>
+<h3>Hands-free from an RMM shell</h3>
+<pre><code>.\OneDriveDiag.ps1 -Level Standard -Unattended -Zip -LargeDatasetAction TopLevel</code></pre>
+<h3>One project folder inside a very large library</h3>
+<pre><code>.\OneDriveDiag.ps1 -Level Standard -Unattended -Zip -SyncRoot 'C:\Users\jsmith\Contoso\Projects - Documents' -FocusPath 'Project A'</code></pre>
+<h3>Everything, delivered as one zip</h3>
+<pre><code>.\OneDriveDiag.ps1 -Level Deep -IncludeFullIndex -ZipOnly</code></pre>
+<h3>Quick check with a different output folder</h3>
+<pre><code>.\OneDriveDiag.ps1 -Level Quick -OutputRoot 'D:\Diag' -OpenOutput</code></pre>
+
+<h2 id="rmm">11. RMM shell use</h2>
+<ul>
+<li>Use a <b>user context</b> shell, not the system shell. OneDrive data is in the user profile.</li>
+<li>Add <code>-Unattended</code>. Prompts do not work reliably in many RMM shells.</li>
+<li>The tool writes to files and shows only short status lines, so the shell buffer is not flooded. Do not print the contents of ODL files in the shell. Read the signature file instead.</li>
+<li>Use <code>-Zip</code> so there is one file to collect.</li>
+<li>Run elevated if you want the filter driver list (fltmc). Everything else works without elevation.</li>
+</ul>
+
+<h2 id="safety">12. Safety and privacy</h2>
+<ul>
+<li>Read-only. The tool does not start, stop, reset or reconfigure OneDrive.</li>
+<li>It reads registry keys, ini files, event logs, folder metadata and ODL logs. It runs reg export, netsh, fsutil (query only), dsregcmd, sc query, w32tm and fltmc (when elevated).</li>
+<li>It does not read the content of user files.</li>
+<li>The package contains the user email, tenant and site names, library URLs, file and folder names, and event log text. Treat it as confidential. Store it only in approved ticket or file storage.</li>
+</ul>
+
+<h2 id="trouble">13. Troubleshooting</h2>
+<table>
+<tr><th>Symptom</th><th>Cause and action</th></tr>
+<tr><td>"Running scripts is disabled"</td><td>Start with <code>powershell.exe -ExecutionPolicy Bypass -File ...</code> or unblock the file.</td></tr>
+<tr><td>"STOP: This script is running as SYSTEM"</td><td>Open a user context shell and run again.</td></tr>
+<tr><td>Warning that the desktop user is different</td><td>You are running as another account. Run as the desktop user, or continue knowing the data may be for the wrong profile.</td></tr>
+<tr><td>Prompt does not appear</td><td>The shell has no console input. The tool detects this, prints "No interactive console found", and uses the defaults. Add <code>-Unattended</code> to make this explicit.</td></tr>
+<tr><td>Language mode errors (ConstrainedLanguage)</td><td>The tool uses .NET classes and needs FullLanguage mode. Application control policy may block it.</td></tr>
+<tr><td>Garbled text in an RMM shell</td><td>The shell code page is wrong. Read the files instead of the shell output.</td></tr>
+<tr><td>Scan shows PARTIAL</td><td>The time limit was reached. Use <code>-FocusPath</code> or raise <code>-ScanTimeLimitMinutes</code>.</td></tr>
+<tr><td>Zip failed</td><td>The folder is kept. Zip it manually. Check free disk space.</td></tr>
+<tr><td>Registry export shows "Not present"</td><td>Normal. The key does not exist on this PC.</td></tr>
+</table>
+
+<h2 id="design">14. Design notes</h2>
+<ul>
+<li><b>Sync roots come from Windows, not from guessing.</b> The tool reads <code>HKCU:\Software\SyncEngines\Providers\OneDrive</code> and the library table (<code>libraryScope</code> and <code>libraryFolder</code> lines) in the account ini file. It then removes duplicates by local folder.</li>
+<li><b>OneDrive ini files are UTF-16 without a byte order mark.</b> Get-Content reads them as garbage on Windows PowerShell 5.1, so every check silently finds nothing. The tool detects the encoding from the bytes and reads every OneDrive text file through one helper.</li>
+<li><b>Compressed logs.</b> An .odlgz file is a 256 byte ODL header followed by gzip data. The tool finds the gzip signature and decompresses in memory. .odlsent files are already uploaded and stripped, so they are skipped.</li>
+<li><b>No console, no hang.</b> When the input stream is closed (RMM shells), Read-Host returns nothing. The tool treats that as unattended mode for the rest of the run.</li>
+<li><b>Portable zip.</b> Entries are written with forward slashes. The built-in folder zip on Windows PowerShell 5.1 writes backslashes, which some unzip tools cannot extract.</li>
+<li><b>Healthy counters are evidence.</b> SyncDiagnostics.log counters at zero show the engine is not failing. The tool reports this as a PASS so it can be used to rule the client out.</li>
+<li><b>Binary logs are summarised, not dumped.</b> ODL files are read in memory, short readable snippets are cut around error words, ids are replaced by markers, and snippets are counted. Hundreds of thousands of lines become a short list.</li>
+<li><b>File state is decoded.</b> Cloud Files uses attribute bits that .NET does not name: online-only (0x400000 and 0x1000), pinned (0x80000), unpinned (0x100000). The tool decodes them.</li>
+<li><b>Reparse points are not errors.</b> OneDrive placeholders are reparse points. The tool samples folders that carry no cloud flag and checks their reparse tag, so real junctions and symbolic links are separated from placeholders.</li>
+<li><b>Name checks match what SharePoint rejects</b> (leading or trailing spaces, trailing period, reserved names, _vti_, a Forms folder at the library root). The characters # and % are not flagged because current OneDrive accepts them.</li>
+<li><b>Server path estimate.</b> Library URL path length plus the path below the sync root. It is an estimate against the 400 character SharePoint limit.</li>
+<li><b>No third-party modules.</b> The script uses built-in cmdlets and .NET only. It does not use any custom module.</li>
+<li><b>Written for Windows PowerShell 5.1.</b> It also runs in PowerShell 7 on Windows.</li>
+</ul>
+
+<h2 id="limits">15. Limitations</h2>
+<ul>
+<li>The tool sees the PC, not SharePoint Online. It cannot see a site storage lock, permissions, checked-out files or item metadata. Compare a failing item with the web.</li>
+<li>The tool cannot see which exact items show a red cross in File Explorer. Ask the user for a screenshot and a full path. The exceptions CSV narrows the list.</li>
+<li>ODL log text differs between OneDrive versions. Some versions hold little readable text.</li>
+<li>Elevation is needed for the filter driver list. Reparse tag sampling uses fsutil and may be unavailable without elevation.</li>
+<li>Event log names differ on some builds. Missing logs are skipped quietly.</li>
+<li>Version 1.0.0 was tested on Windows 11 with Windows PowerShell 5.1 and PowerShell 7 (Quick, Standard and Deep, interactive fallback, unattended, large library guard, focus folder, zip and zip only), not elevated, on a PC with a work and a personal account. Elevated checks (fltmc, fsutil reparse sampling) and the SYSTEM and user mismatch paths still need field testing. Report any "Step stopped early" finding.</li>
+</ul>
+
+<h2 id="history">16. Version history</h2>
+<table>
+<tr><th>Version</th><th>Change</th></tr>
+<tr><td>1.0.0</td><td>First release. Three levels, single-pass file index, ODL signatures (all log folders, compressed logs), zip option, plain-language summary. Includes Controlled Folder Access, update ring and tenant list checks, free space on every sync root drive, and folder shortcut discovery.</td></tr>
+</table>
+
+</main>
+</div>
+<footer>OneDriveDiag, companion guide, version 1.0.0. The package it creates is confidential.</footer>
+</body>
+</html>

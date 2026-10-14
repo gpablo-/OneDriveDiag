@@ -1,3 +1,6 @@
+# Raw imported material (contains client-specific data - never commit)
+Copilot Session/
+
 # Diagnostic output (may contain user/tenant data)
 Output/
 *.zip
