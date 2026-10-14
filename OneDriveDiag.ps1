@@ -211,6 +211,7 @@ $script:ScanFullIndex = $false
 $script:OdlFilesRead = @()
 $script:OdlFilesToCopy = @()
 $script:BoundParams = @{}
+$script:PendingLog = New-Object System.Collections.ArrayList   # log lines held until the run log exists
 $script:CountFail = 0
 $script:CountWarn = 0
 $script:OutputParent = $null
@@ -234,11 +235,22 @@ $script:AttrNames = @(
 
 function Write-Log {
     # Writes one time-stamped line to 00_RunLog.txt. Never shown on screen.
+    # Lines written before the output folder exists (early questions, start-up checks) are held in memory
+    # and written out by New-OutputFolder, so nothing is lost.
     param([string]$Message, [string]$Level = 'INFO')
+    $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
     if ($script:LogFile) {
-        $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
         try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
     }
+    else { [void]$script:PendingLog.Add($line) }
+}
+
+function Write-Choice {
+    # Records a question and the answer used, so a reviewer can see what the helpdesk chose.
+    param([string]$Question, [string]$Answer)
+    $how = 'answered'
+    if ($script:IsUnattended) { $how = 'default, unattended' }
+    Write-Log -Message ('Choice: {0} -> {1} ({2})' -f $Question, $Answer, $how) -Level 'CHOICE'
 }
 
 function Write-Status {
@@ -351,6 +363,20 @@ function Read-Answer {
 
 function Select-FromList {
     # Shows a numbered list and returns the chosen number(s) as an array of 1-based indexes.
+    # The question and the chosen option text are written to the run log.
+    param(
+        [string]$Title,
+        [string[]]$Options,
+        [int]$DefaultIndex = 1,
+        [switch]$Multiple
+    )
+    $picked = @(Select-FromListCore @PSBoundParameters)
+    Write-Choice -Question $Title -Answer (($picked | ForEach-Object { $Options[$_ - 1] }) -join '; ')
+    return $picked
+}
+
+function Select-FromListCore {
+    # The prompt itself. Use Select-FromList, which also logs the answer.
     param(
         [string]$Title,
         [string[]]$Options,
@@ -401,7 +427,15 @@ function Select-FromList {
 }
 
 function Read-YesNo {
-    # Asks a yes or no question. Returns $true or $false.
+    # Asks a yes or no question. Returns $true or $false. The answer is written to the run log.
+    param([string]$Question, [bool]$DefaultYes = $true)
+    $r = Read-YesNoCore @PSBoundParameters
+    Write-Choice -Question $Question -Answer $(if ($r) { 'Yes' } else { 'No' })
+    return $r
+}
+
+function Read-YesNoCore {
+    # The prompt itself. Use Read-YesNo, which also logs the answer.
     param([string]$Question, [bool]$DefaultYes = $true)
     if ($script:IsUnattended) { return $DefaultYes }
     $hint = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
@@ -416,7 +450,15 @@ function Read-YesNo {
 }
 
 function Read-Text {
-    # Asks for a line of text. Returns the default in unattended mode.
+    # Asks for a line of text. Returns the default in unattended mode. The answer is written to the run log.
+    param([string]$Prompt, [string]$Default = '')
+    $r = Read-TextCore @PSBoundParameters
+    Write-Choice -Question $Prompt -Answer $(if ($r) { $r } else { '(blank)' })
+    return $r
+}
+
+function Read-TextCore {
+    # The prompt itself. Use Read-Text, which also logs the answer.
     param([string]$Prompt, [string]$Default = '')
     if ($script:IsUnattended) { return $Default }
     $a = Read-Answer $Prompt
@@ -498,6 +540,11 @@ function New-OutputFolder {
     $script:OutputParent = $root
     $script:LogFile = Join-Path $script:OutDir '00_RunLog.txt'
     Write-Log ('Script version {0} started by {1} on {2}' -f $script:ScriptVersion, $script:CurrentUser, $env:COMPUTERNAME)
+    # Write out the lines logged before this folder existed (start-up checks and early answers).
+    if ($script:PendingLog.Count -gt 0) {
+        try { Add-Content -LiteralPath $script:LogFile -Value @($script:PendingLog) -Encoding UTF8 -ErrorAction Stop } catch { }
+        $script:PendingLog.Clear()
+    }
 }
 
 function Get-RunSettings {
@@ -1294,7 +1341,7 @@ function Step-CloudFiles {
             if ($flt -notmatch '(?i)CldFlt') {
                 Add-Finding 'Cloud Files' 'CldFlt filter loaded' 'FAIL' 'CldFlt is not in the loaded filter list.' 'Files On-Demand cannot work. Escalate.'
             }
-            $thirdParty = @([regex]::Split($flt, '\r?\n') | Where-Object { $_ -match '^\S+\s+\d+\s+[\d\.]+' -and $_ -notmatch '(?i)^(bindflt|MsSecFlt|UCPD|WdFilter|storqosflt|wcifs|CldFlt|bfs|FileCrypt|luafv|UnionFS|npsvctrig|Wof|FileInfo|applockerflt|PrjFlt|FsDepends|Dfs|DfsDriver|Ntfs|Msfs)\s' })
+            $thirdParty = @([regex]::Split($flt, '\r?\n') | Where-Object { $_ -match '^\S+\s+\d+\s+[\d\.]+' -and $_ -notmatch '(?i)^(bindflt|MsSecFlt|UCPD|WdFilter|storqosflt|wcifs|CldFlt|bfs|FileCrypt|luafv|UnionFS|npsvctrig|Wof|FileInfo|applockerfltr?|PrjFlt|FsDepends|Dfs|DfsDriver|Ntfs|Msfs)\s' })
             if ($thirdParty.Count -gt 0) {
                 $names = @($thirdParty | ForEach-Object { ($_ -split '\s+')[0] })
                 [void]$o.Add('')
